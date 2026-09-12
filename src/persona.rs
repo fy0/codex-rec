@@ -1,15 +1,17 @@
 //! Device persona: rebuild the outgoing identity (User-Agent, `originator`, `?client_version=`)
 //! from the incoming request.
 //!
-//! Field semantics (v0.3): omitted -> built-in default, `"inherit"` -> the client's value,
-//! anything else -> that literal value. See [`crate::config::PERSONA_DEFAULTS`].
+//! Field semantics: a key that is **absent** inherits the client's value, exactly like the
+//! explicit alias `"inherit"`; any other value replaces that part. `terminal = ""` removes the
+//! terminal segment (`""` is rejected for the other fields, see `config::Persona::validate`).
+//! If the incoming User-Agent cannot be parsed we leave it untouched rather than inventing one.
 //!
 //! Measured real-codex User-Agent shapes (codex-cli 0.153.4, Linux):
 //!   full  : `codex-tui/0.153.4 (Debian 12.0.0; x86_64) tmux/3.3a (codex-tui; 0.153.4)`
 //!   no tail: `codex-tui/0.153.4 (Debian 12.0.0; x86_64) tmux/3.3a`
 //!   short : `codex_cli_rs/0.153.4 (Debian 12.0.0; x86_64)`
 
-use crate::config::{Config, Field, Persona, PERSONA_DEFAULTS};
+use crate::config::{Config, Field, Persona};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UaParts {
@@ -64,69 +66,31 @@ pub fn compose_ua(parts: &UaParts) -> String {
     out
 }
 
-/// Resolves one persona field to a concrete value, or `None` when the client's value must be kept
-/// but is unavailable (in which case the whole User-Agent is left untouched).
-fn resolve_part(
-    field: &Field,
-    client: Option<&str>,
-    default: &str,
-    default_inherits: bool,
-) -> Option<String> {
+/// Resolves one persona field: absent or `"inherit"` -> the client's value, otherwise the value.
+/// Returns `None` when the client's value was requested but the incoming User-Agent had none
+/// (the caller then leaves the whole User-Agent untouched).
+fn resolve_part(field: &Option<Field>, client: Option<&str>) -> Option<String> {
     match field {
-        Field::Set(value) => Some(value.to_owned()),
-        Field::Inherit => client.map(str::to_owned),
-        Field::Default => {
-            if default_inherits {
-                client.map(str::to_owned)
-            } else {
-                Some(default.to_owned())
-            }
-        }
+        None => client.map(str::to_owned),
+        Some(Field::Inherit) => client.map(str::to_owned),
+        Some(Field::Set(value)) => Some(value.clone()),
     }
 }
 
 /// Returns the rewritten User-Agent (or `None` when nothing should change).
 pub fn rewrite_user_agent(persona: &Persona, incoming: &str) -> Option<String> {
-    if let Field::Set(literal) = &persona.user_agent {
+    // A literal User-Agent wins over every field above; "inherit" (or an absent key) means
+    // "compose from the fields", so a persona that only pins the version still takes effect.
+    if let Some(Field::Set(literal)) = persona.user_agent.as_ref() {
         return (literal != incoming).then(|| literal.clone());
     }
-    if persona.user_agent.is_inherit() {
-        return None;
-    }
 
-    let parsed = parse_ua(incoming);
-    let defaults = PERSONA_DEFAULTS;
-    let originator = resolve_part(
-        &persona.originator,
-        parsed.as_ref().map(|p| p.originator.as_str()),
-        defaults.originator,
-        false,
-    )?;
-    let version = resolve_part(
-        &persona.codex_version,
-        parsed.as_ref().map(|p| p.version.as_str()),
-        defaults.originator,
-        defaults.codex_version_inherits,
-    )?;
-    let os = resolve_part(
-        &persona.os,
-        parsed.as_ref().map(|p| p.os.as_str()),
-        defaults.os,
-        false,
-    )?;
-    let arch = resolve_part(
-        &persona.arch,
-        parsed.as_ref().map(|p| p.arch.as_str()),
-        defaults.arch,
-        false,
-    )?;
-    let terminal = resolve_part(
-        &persona.terminal,
-        parsed.as_ref().and_then(|p| p.terminal.as_deref()),
-        defaults.terminal,
-        false,
-    )
-    .filter(|t| !t.is_empty());
+    let parsed = parse_ua(incoming)?;
+    let originator = resolve_part(&persona.originator, Some(parsed.originator.as_str()))?;
+    let version = resolve_part(&persona.codex_version, Some(parsed.version.as_str()))?;
+    let os = resolve_part(&persona.os, Some(parsed.os.as_str()))?;
+    let arch = resolve_part(&persona.arch, Some(parsed.arch.as_str()))?;
+    let terminal = resolve_part(&persona.terminal, parsed.terminal.as_deref()).filter(|t| !t.is_empty());
 
     let parts = UaParts {
         originator,
@@ -134,7 +98,7 @@ pub fn rewrite_user_agent(persona: &Persona, incoming: &str) -> Option<String> {
         os,
         arch,
         terminal,
-        suffix: parsed.as_ref().map(|p| p.suffix).unwrap_or(false),
+        suffix: parsed.suffix,
     };
     let composed = compose_ua(&parts);
     (composed != incoming).then_some(composed)
@@ -164,11 +128,11 @@ pub fn rewrite_client_version(query: &str, version: &str) -> Option<String> {
     }
 }
 
-fn resolved_originator(persona: &Persona) -> Option<String> {
-    match &persona.originator {
-        Field::Set(value) => Some(value.clone()),
-        Field::Inherit => None,
-        Field::Default => Some(PERSONA_DEFAULTS.originator.to_owned()),
+/// The originator value to force, or `None` when the client's own value stays.
+fn override_originator(persona: &Persona) -> Option<&str> {
+    match persona.originator.as_ref() {
+        Some(Field::Set(value)) => Some(value.as_str()),
+        _ => None,
     }
 }
 
@@ -192,10 +156,10 @@ pub fn apply(cfg: &Config, headers: &mut reqwest::header::HeaderMap, uri: &mut S
         }
     }
 
-    if let Some(originator) = resolved_originator(persona) {
+    if let Some(originator) = override_originator(persona) {
         let key = reqwest::header::HeaderName::from_static("originator");
         if headers.contains_key(&key) {
-            if let Ok(value) = reqwest::header::HeaderValue::from_str(&originator) {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(originator) {
                 headers.insert(key, value);
                 notes.push(format!("originator -> {originator}"));
             }
@@ -203,7 +167,7 @@ pub fn apply(cfg: &Config, headers: &mut reqwest::header::HeaderMap, uri: &mut S
     }
 
     if persona.rewrite_client_version {
-        if let Some(version) = persona.codex_version.value() {
+        if let Some(version) = persona.codex_version.as_ref().and_then(Field::value) {
             if let Some(rewritten) = rewrite_client_version(uri, version) {
                 notes.push(format!("path: {uri} -> {rewritten}"));
                 *uri = rewritten;
@@ -217,10 +181,9 @@ pub fn apply(cfg: &Config, headers: &mut reqwest::header::HeaderMap, uri: &mut S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    fn persona_from(value: serde_json::Value) -> Persona {
-        serde_json::from_value(value).expect("persona")
+    fn persona(toml_str: &str) -> Persona {
+        toml::from_str(toml_str).expect("persona")
     }
 
     const CLIENT_UA: &str =
@@ -244,23 +207,10 @@ mod tests {
     }
 
     #[test]
-    fn omitted_fields_take_the_built_in_defaults() {
-        // Only the version is pinned; everything else falls back to the defaults
-        // (originator codex-tui, Linux/x86_64, no terminal segment).
-        let persona = persona_from(json!({ "codex_version": "0.145.0" }));
-        let out = rewrite_user_agent(&persona, CLIENT_UA).unwrap();
-        assert_eq!(out, "codex-tui/0.145.0 (Linux; x86_64) (codex-tui; 0.145.0)");
-    }
-
-    #[test]
-    fn inherit_keeps_the_clients_parts() {
-        let persona = persona_from(json!({
-            "codex_version": "0.145.0",
-            "os": "inherit",
-            "arch": "inherit",
-            "terminal": "inherit"
-        }));
-        let out = rewrite_user_agent(&persona, CLIENT_UA).unwrap();
+    fn omitted_fields_inherit_the_client() {
+        // Only the version is pinned: OS, architecture and terminal stay exactly as the client sent.
+        let p = persona(r#"codex_version = "0.145.0""#);
+        let out = rewrite_user_agent(&p, CLIENT_UA).unwrap();
         assert_eq!(
             out,
             "codex-tui/0.145.0 (Debian 12.0.0; x86_64) xterm-256color (codex-tui; 0.145.0)"
@@ -268,16 +218,53 @@ mod tests {
     }
 
     #[test]
+    fn explicit_inherit_behaves_like_an_absent_key() {
+        let absent = persona(r#"codex_version = "0.145.0""#);
+        let explicit = persona(
+            r#"
+            codex_version = "0.145.0"
+            originator = "inherit"
+            os = "inherit"
+            arch = "inherit"
+            terminal = "inherit"
+            "#,
+        );
+        assert_eq!(
+            rewrite_user_agent(&absent, CLIENT_UA),
+            rewrite_user_agent(&explicit, CLIENT_UA)
+        );
+    }
+
+    #[test]
     fn empty_terminal_removes_the_segment() {
-        let persona = persona_from(json!({ "terminal": "" }));
-        let out = rewrite_user_agent(&persona, CLIENT_UA).unwrap();
-        assert_eq!(out, "codex-tui/0.153.4 (Linux; x86_64) (codex-tui; 0.153.4)");
+        let p = persona(r#"terminal = """#);
+        let out = rewrite_user_agent(&p, CLIENT_UA).unwrap();
+        assert_eq!(out, "codex-tui/0.153.4 (Debian 12.0.0; x86_64) (codex-tui; 0.153.4)");
     }
 
     #[test]
     fn literal_user_agent_wins() {
-        let persona = persona_from(json!({ "user_agent": "curl/7.88.1", "originator": "x" }));
-        assert_eq!(rewrite_user_agent(&persona, CLIENT_UA).as_deref(), Some("curl/7.88.1"));
+        let p = persona(
+            r#"
+            user_agent = "curl/7.88.1"
+            originator = "x"
+            "#,
+        );
+        assert_eq!(rewrite_user_agent(&p, CLIENT_UA).as_deref(), Some("curl/7.88.1"));
+    }
+
+    #[test]
+    fn nothing_to_change_returns_none() {
+        let p = persona(r#"originator = "codex-tui""#);
+        assert_eq!(rewrite_user_agent(&p, CLIENT_UA), None);
+        let p = persona(r#"os = "inherit""#);
+        assert_eq!(rewrite_user_agent(&p, CLIENT_UA), None);
+    }
+
+    #[test]
+    fn unparseable_user_agent_is_left_alone() {
+        let p = persona(r#"codex_version = "0.145.0""#);
+        assert_eq!(rewrite_user_agent(&p, "curl/7.88.1"), None);
     }
 
     #[test]

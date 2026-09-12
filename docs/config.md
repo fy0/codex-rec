@@ -18,10 +18,12 @@ upstream = "https://chatgpt.com"
 log_dir  = "/root/rec"
 
 # ---------------------------------------------------------------- device persona
-# Each field has three states:
-#   - omitted      -> the built-in default (see the table below)
-#   - "inherit"    -> keep whatever the client sent
-#   - any value    -> use that value ("" removes a segment such as `terminal`)
+# Each field has three states, decided by whether the key is present:
+#   - key absent      -> inherit the client's value (nothing is rewritten)
+#   - "inherit"       -> same as absent, kept as a readable alias
+#   - any other value -> use that value
+#   - "" is only valid for `terminal` (it removes the terminal segment); an empty
+#     originator/codex_version/os/arch/user_agent is a config error instead of a broken UA
 [persona]
 originator    = "codex-tui"        # `originator` header + User-Agent product name
 codex_version = "0.145.0"          # User-Agent version segments (+ ?client_version=)
@@ -44,6 +46,17 @@ set  = { }
 drop = [ ]
 set  = { }
 
+# ---------------------------------------------------------------- path mapping
+# `upstream_prefix` defaults to /backend-api/codex ON PURPOSE: codex only treats a provider as the
+# codex backend when its base_url ends with that path (model-provider-info/src/lib.rs,
+# supports_codex_backend_routes). With any other path it stops sending codex-backend-only headers
+# such as x-codex-routing-hint and the request shape changes. `/v1` and `/` are accepted as
+# *incoming* aliases so other OpenAI-style clients can use the proxy — they are not the default,
+# and codex itself should keep using /backend-api/codex.
+[routes]
+upstream_prefix = "/backend-api/codex"
+strip_prefixes  = ["/backend-api/codex", "/v1", "/api/v1"]
+
 # ---------------------------------------------------------------- TLS
 [tls]
 # fixed     -> native-tls / OpenSSL, no ALPN, HTTP/1.1: byte-identical ClientHello to the real
@@ -62,26 +75,44 @@ session_capture = true
 session_dir     = "./sessions"
 ```
 
-## Persona field defaults
+## Persona field states
 
-An omitted field uses the built-in default; write `"inherit"` to keep the client's value instead.
+Whether a key is **present** decides what happens — there are no hidden defaults:
 
-| field | omitted -> default | notes |
-|---|---|---|
-| `originator` | `codex-tui` | also the User-Agent product name |
-| `codex_version` | *inherit* | we never invent a version: the claimed version decides which model catalog the server returns |
-| `os` | `Linux` | the `<os>; <arch>` part of the User-Agent |
-| `arch` | `x86_64` | |
-| `terminal` | *(empty)* | no terminal segment |
-| `user_agent` | *composed* | set it to ship a literal User-Agent instead |
+| config | effect |
+|---|---|
+| key absent | inherit the client's value |
+| `field = "inherit"` | same as absent (readable alias) |
+| `field = "some value"` | use that value |
+| `field = ""` | only valid for `terminal`: removes the terminal segment. Anywhere else it is a config error |
 
-Example — pin only the version, let everything else fall back to the defaults:
+So the smallest useful persona changes exactly one thing and leaves everything else untouched:
 
 ```toml
 [persona]
 codex_version = "0.145.0"
-# -> user-agent: codex-tui/0.145.0 (Linux; x86_64) (codex-tui; 0.145.0)
+# client : codex-tui/0.153.4 (Debian 12.0.0; x86_64) xterm-256color (codex-tui; 0.153.4)
+# upstream: codex-tui/0.145.0 (Debian 12.0.0; x86_64) xterm-256color (codex-tui; 0.145.0)
 ```
+
+Incoming User-Agents that do not parse (anything that is not `product/version (os; arch) …`) are
+left untouched rather than replaced with a guess.
+
+## Path mapping
+
+`[routes]` maps what clients call onto what the codex backend expects:
+
+| incoming | upstream |
+|---|---|
+| `/backend-api/codex/responses` | `/backend-api/codex/responses` (unchanged — this is what codex sends) |
+| `/v1/responses` | `/backend-api/codex/responses` |
+| `/api/v1/models?client_version=…` | `/backend-api/codex/models?client_version=…` |
+| `/responses` | `/backend-api/codex/responses` |
+
+Keep `upstream_prefix = "/backend-api/codex"` for codex clients: codex only treats a provider as the
+codex backend when its `base_url` ends with that path, otherwise it stops sending codex-backend-only
+headers such as `x-codex-routing-hint`. `/v1` and `/` exist for other OpenAI-style clients; they are
+not the default. Incoming and outgoing paths are both recorded (`req-*.hdr` vs `req-*.out.hdr`).
 
 ## Swapping credentials
 

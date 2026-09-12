@@ -420,7 +420,18 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
     let cfg = &app.cfg;
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
-    let mut uri = parts.uri.to_string();
+    // `uri_in` is what the client asked for (logged as-is); `uri` is what we actually send
+    // upstream after the [routes] path mapping. Both are recorded, so the mapping stays auditable.
+    let uri_in = parts.uri.to_string();
+    let (in_path, in_query) = match uri_in.split_once('?') {
+        Some((path, query)) => (path.to_owned(), Some(query.to_owned())),
+        None => (uri_in.clone(), None),
+    };
+    let mut uri = cfg.routes.upstream_path(&in_path);
+    if let Some(query) = in_query {
+        uri.push('?');
+        uri.push_str(&query);
+    }
     let req_stamp = stamp();
     let prefix = req_stamp.clone();
 
@@ -464,7 +475,7 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
     }
     let _ = fs::write(
         cfg.log_dir.join(format!("req-{req_stamp}.hdr")),
-        format!("{method} {uri}\n{}", header_dump(&incoming_lines)),
+        format!("{method} {uri_in}\n{}", header_dump(&incoming_lines)),
     );
     let _ = fs::write(cfg.log_dir.join(format!("req-{req_stamp}.body")), &body_bytes);
 
@@ -753,6 +764,10 @@ async fn main() {
         cfg.upstream
     );
     println!("recording into {}", cfg.log_dir.display());
+    println!(
+        "routes: strip {:?} -> prefix {:?}",
+        cfg.routes.strip_prefixes, cfg.routes.upstream_prefix
+    );
     if let Some(p) = cfg.config_path.as_ref() {
         println!("config file: {}", p.display());
     }

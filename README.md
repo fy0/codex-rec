@@ -62,8 +62,9 @@ user-agent: codex-tui/0.145.0 (Debian 12.0.0; x86_64) xterm-256color (codex-tui;
 | | |
 |---|---|
 | recording | incoming/outgoing headers, raw + zstd-decoded bodies, streamed responses, per-request summaries (`model`, `service_tier`, reasoning effort, `client_metadata`), and the Cloudflare `__oailb` origin pool decoded from every response |
-| persona | three-state fields per attribute: omitted = built-in default, `"inherit"` = the client's value, or an explicit value (originator, codex version, OS, arch, terminal, literal User-Agent) |
+| persona | three-state fields per attribute, decided by whether the key is present: absent = inherit the client's value, `"inherit"` = the same, any value = replace it (`terminal = ""` removes the segment) |
 | header rewriting | drop/set both directions, from the config file or CLI flags; `drop` patterns are globs (`cf-*`) |
+| path mapping | `[routes]` maps `/v1` or `/` onto the codex path `/backend-api/codex` for non-codex clients; codex itself keeps using `/backend-api/codex` |
 | body rewriting | remove/replace JSON keys (zstd is decoded and re-encoded automatically) |
 | catalog rewriting | `--rewrite-catalog` forces `use_responses_lite=false` and clears `service_tiers` in `/models` |
 | session capture | one interaction log per codex session: `sessions/ss-<date>-<uuid>-<title>.jsonl` (requests with decoded bodies, responses with the answer text) |

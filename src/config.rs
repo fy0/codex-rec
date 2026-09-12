@@ -1,9 +1,11 @@
 //! Configuration: a TOML file plus the existing CLI flags.
 //!
-//! Three-state persona fields (v0.3):
-//!   * omitted            -> the built-in default (see [`persona_defaults`])
-//!   * `"inherit"`        -> keep whatever the client sent
-//!   * any other value    -> use that value
+//! Persona fields have three states, distinguished by whether the key is *present*:
+//!   * the key is absent            -> inherit the client's value
+//!   * the key is `"inherit"`       -> same as absent (kept as a readable alias)
+//!   * the key has any other value  -> use that value
+//!   * `""` is only meaningful for `terminal` (it removes the terminal segment); an empty
+//!     `originator` / `codex_version` / `os` / `arch` / `user_agent` is a config error.
 //!
 //! Header drop lists accept simple glob patterns (`cf-*`, `x-forwarded-*`), matched with the
 //! `globset` crate, compiled once at startup.
@@ -19,32 +21,20 @@ use std::sync::Arc;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
-/// A persona field: default / inherit from the client / fixed value.
+/// A persona field: inherit from the client, or use a fixed value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Field {
-    /// Not written in the config: use the built-in default for this field.
-    Default,
-    /// Explicitly `"inherit"`: keep the client's value.
+    /// Explicitly `"inherit"`: keep the client's value (same as leaving the key out).
     Inherit,
-    /// A concrete replacement.
+    /// A concrete replacement. An empty string is only valid for `terminal`.
     Set(String),
 }
 
-impl Default for Field {
-    fn default() -> Self {
-        Field::Default
-    }
-}
-
 impl Field {
-    pub fn is_inherit(&self) -> bool {
-        matches!(self, Field::Inherit)
-    }
-
     pub fn value(&self) -> Option<&str> {
         match self {
             Field::Set(v) => Some(v.as_str()),
-            _ => None,
+            Field::Inherit => None,
         }
     }
 }
@@ -63,52 +53,66 @@ impl<'de> Deserialize<'de> for Field {
     }
 }
 
-/// Built-in defaults used when a `[persona]` field is omitted.
-///
-/// `codex_version` is intentionally "inherit": we never invent a version, because the version we
-/// claim decides which model catalog the server returns (a mismatched claim costs you metadata).
-#[derive(Debug, Clone, Copy)]
-pub struct PersonaDefaults {
-    pub originator: &'static str,
-    pub os: &'static str,
-    pub arch: &'static str,
-    pub terminal: &'static str,
-    pub codex_version_inherits: bool,
-}
-
-pub const PERSONA_DEFAULTS: PersonaDefaults = PersonaDefaults {
-    originator: "codex-tui",
-    os: "Linux",
-    arch: "x86_64",
-    terminal: "",
-    codex_version_inherits: true,
-};
-
-/// Device identity that the upstream should see.
+/// Device identity that the upstream should see. `None` means "inherit the client's value".
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Persona {
-    /// `originator` header and the product name inside the User-Agent. Default `codex-tui`.
+    /// `originator` header and the product name inside the User-Agent.
     #[serde(default)]
-    pub originator: Field,
-    /// Codex version: both User-Agent version segments. Default: inherit from the client.
+    pub originator: Option<Field>,
+    /// Codex version: both User-Agent version segments (and `?client_version=` if enabled).
     #[serde(default)]
-    pub codex_version: Field,
-    /// `<os>; <arch>` inside the User-Agent. Default `Linux`.
+    pub codex_version: Option<Field>,
+    /// `<os>; <arch>` inside the User-Agent.
     #[serde(default)]
-    pub os: Field,
-    /// Architecture inside the User-Agent. Default `x86_64`.
+    pub os: Option<Field>,
+    /// Architecture inside the User-Agent.
     #[serde(default)]
-    pub arch: Field,
-    /// Terminal segment of the User-Agent. Default: omitted; set `""` to force-remove it.
+    pub arch: Option<Field>,
+    /// Terminal segment of the User-Agent. `""` removes it; absent keeps the client's.
     #[serde(default)]
-    pub terminal: Field,
-    /// Escape hatch: a complete literal User-Agent (wins over every field above). Default: composed.
+    pub terminal: Option<Field>,
+    /// Escape hatch: a complete literal User-Agent (wins over every field above).
     #[serde(default)]
-    pub user_agent: Field,
-    /// Also rewrite `?client_version=`. Default false.
+    pub user_agent: Option<Field>,
+    /// Also rewrite `?client_version=` (needs `codex_version` to be set).
     #[serde(default)]
     pub rewrite_client_version: bool,
+}
+
+impl Persona {
+    /// True when at least one field carries a value (otherwise nothing is rewritten at all).
+    pub fn is_active(&self) -> bool {
+        [
+            &self.originator,
+            &self.codex_version,
+            &self.os,
+            &self.arch,
+            &self.terminal,
+            &self.user_agent,
+        ]
+        .iter()
+        .any(|f| matches!(f, Some(Field::Set(_))))
+    }
+
+    /// Rejects empty values where they would produce an invalid User-Agent.
+    fn validate(&self) -> Result<(), String> {
+        for (name, field) in [
+            ("originator", &self.originator),
+            ("codex_version", &self.codex_version),
+            ("os", &self.os),
+            ("arch", &self.arch),
+            ("user_agent", &self.user_agent),
+        ] {
+            if field.as_ref().and_then(Field::value) == Some("") {
+                return Err(format!(
+                    "persona.{name} must not be empty: omit the key (or write \"inherit\") to keep \
+                     the client's value, write a value to replace it — only persona.terminal may be \"\""
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -147,6 +151,78 @@ pub struct HeaderSection {
     pub response: HeaderRules,
 }
 
+/// Path mapping between what clients call and what the codex backend expects.
+///
+/// `upstream_prefix` defaults to `/backend-api/codex` **on purpose**: codex only treats a provider
+/// as the codex backend when its `base_url` ends with that path
+/// (`model-provider-info/src/lib.rs`, `supports_codex_backend_routes`); with any other path it stops
+/// sending codex-backend-only headers such as `x-codex-routing-hint` and the request shape changes.
+/// `/v1` and `/` are accepted as *incoming* aliases for other OpenAI-style clients — they are not
+/// the default, and codex itself should keep using `/backend-api/codex`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutesSection {
+    /// Prefix prepended to the normalized path before the request goes upstream.
+    #[serde(default = "default_upstream_prefix")]
+    pub upstream_prefix: String,
+    /// Incoming prefixes that are stripped before `upstream_prefix` is added (longest match wins).
+    #[serde(default = "default_strip_prefixes")]
+    pub strip_prefixes: Vec<String>,
+}
+
+fn default_upstream_prefix() -> String {
+    "/backend-api/codex".to_owned()
+}
+
+fn default_strip_prefixes() -> Vec<String> {
+    vec![
+        "/backend-api/codex".to_owned(),
+        "/v1".to_owned(),
+        "/api/v1".to_owned(),
+    ]
+}
+
+impl Default for RoutesSection {
+    fn default() -> Self {
+        Self {
+            upstream_prefix: default_upstream_prefix(),
+            strip_prefixes: default_strip_prefixes(),
+        }
+    }
+}
+
+impl RoutesSection {
+    /// Maps an incoming request path to the path sent upstream:
+    /// strip one known incoming prefix (longest first), then prepend `upstream_prefix`.
+    pub fn upstream_path(&self, path: &str) -> String {
+        let mut rest = path;
+        let mut prefixes: Vec<&String> = self.strip_prefixes.iter().collect();
+        prefixes.sort_by_key(|p| std::cmp::Reverse(p.trim_end_matches('/').len()));
+        for prefix in prefixes {
+            let prefix = prefix.trim_end_matches('/');
+            if prefix.is_empty() {
+                continue;
+            }
+            if rest == prefix {
+                rest = "/";
+                break;
+            }
+            if let Some(tail) = rest.strip_prefix(prefix) {
+                if tail.starts_with('/') {
+                    rest = tail;
+                    break;
+                }
+            }
+        }
+        let prefix = self.upstream_prefix.trim_end_matches('/');
+        if prefix.is_empty() {
+            rest.to_owned()
+        } else {
+            format!("{prefix}{rest}")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionOrder {
     /// native-tls / OpenSSL: fixed extension order, exactly like the real codex client.
@@ -178,14 +254,16 @@ struct FileConfig {
     upstream: Option<String>,
     #[serde(default)]
     log_dir: Option<PathBuf>,
-    /// Present at all -> the persona is active (omitted fields use the built-in defaults).
+    /// Present at all -> the persona is active (fields left out inherit the client's value).
     #[serde(default)]
     persona: Option<Persona>,
     #[serde(default)]
     headers: HeaderSection,
     #[serde(default)]
+    routes: RoutesSection,
+    #[serde(default)]
     tls: TlsSection,
-    /// `true` -> also write one JSONL file per session under `session_dir`.
+    /// `true` -> also write one JSONL file per session under `session_dir` (off by default).
     #[serde(default)]
     session_capture: bool,
     #[serde(default)]
@@ -203,6 +281,7 @@ pub struct Config {
     pub response_rules: HeaderRules,
     pub request_drop_globs: Option<Arc<GlobSet>>,
     pub response_drop_globs: Option<Arc<GlobSet>>,
+    pub routes: RoutesSection,
     pub extension_order: ExtensionOrder,
     pub body_drop: Vec<String>,
     pub body_set: Vec<(String, String)>,
@@ -269,6 +348,17 @@ pub fn load() -> Result<(Config, Vec<String>), String> {
         }
         None => FileConfig::default(),
     };
+
+    if let Some(persona) = file.persona.as_ref() {
+        persona.validate()?;
+        if !persona.is_active() {
+            warnings.push(
+                "persona has no values: every field inherits the client's identity, so nothing is \
+                 rewritten"
+                    .to_owned(),
+            );
+        }
+    }
 
     let list = |key: &str| -> Vec<String> {
         values
@@ -345,6 +435,7 @@ pub fn load() -> Result<(Config, Vec<String>), String> {
         response_rules,
         request_drop_globs,
         response_drop_globs,
+        routes: file.routes.clone(),
         extension_order,
         body_drop: values
             .get("drop-body-key")
@@ -381,4 +472,73 @@ pub fn load() -> Result<(Config, Vec<String>), String> {
         );
     }
     Ok((cfg, warnings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_and_inherit_and_empty_are_distinct() {
+        let persona: Persona = toml::from_str(
+            r#"
+            codex_version = "0.145.0"
+            os = "inherit"
+            terminal = ""
+            "#,
+        )
+        .unwrap();
+        assert_eq!(persona.codex_version.as_ref().and_then(Field::value), Some("0.145.0"));
+        assert!(matches!(persona.os, Some(Field::Inherit)));
+        assert_eq!(persona.terminal.as_ref().and_then(Field::value), Some(""));
+        assert!(persona.arch.is_none());
+        assert!(persona.is_active());
+    }
+
+    #[test]
+    fn empty_values_are_rejected_where_they_make_no_sense() {
+        for bad in ["os = \"\"", "originator = \"\"", "arch = \"\"", "user_agent = \"\"", "codex_version = \"\""] {
+            let persona: Persona = toml::from_str(bad).unwrap();
+            assert!(persona.validate().is_err(), "{bad} should be rejected");
+        }
+        let ok: Persona = toml::from_str("terminal = \"\"").unwrap();
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn only_inherits_means_inactive() {
+        let persona: Persona = toml::from_str("os = \"inherit\"\narch = \"inherit\"").unwrap();
+        assert!(!persona.is_active());
+        assert!(persona.validate().is_ok());
+    }
+
+    #[test]
+    fn route_mapping_defaults_to_the_codex_path() {
+        let routes = RoutesSection::default();
+        assert_eq!(routes.upstream_path("/backend-api/codex/responses"), "/backend-api/codex/responses");
+        assert_eq!(routes.upstream_path("/v1/responses"), "/backend-api/codex/responses");
+        assert_eq!(routes.upstream_path("/v1/models"), "/backend-api/codex/models");
+        assert_eq!(routes.upstream_path("/api/v1/responses"), "/backend-api/codex/responses");
+        assert_eq!(routes.upstream_path("/responses"), "/backend-api/codex/responses");
+        assert_eq!(routes.upstream_path("/"), "/backend-api/codex/");
+        assert_eq!(routes.upstream_path("/backend-api/codex"), "/backend-api/codex/");
+    }
+
+    #[test]
+    fn route_mapping_can_be_reconfigured() {
+        // An empty upstream prefix means "forward the stripped path as-is".
+        let routes: RoutesSection = toml::from_str(r#"upstream_prefix = """#).unwrap();
+        assert_eq!(routes.upstream_path("/v1/responses"), "/responses");
+
+        let routes: RoutesSection = toml::from_str(
+            r#"
+            upstream_prefix = "/backend-api/codex"
+            strip_prefixes = ["/openai/v1", "/v1"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(routes.upstream_path("/openai/v1/models"), "/backend-api/codex/models");
+        assert_eq!(routes.upstream_path("/v1/models"), "/backend-api/codex/models");
+        assert_eq!(routes.upstream_path("/other/models"), "/backend-api/codex/other/models");
+    }
 }

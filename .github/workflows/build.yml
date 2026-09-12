@@ -32,7 +32,7 @@ jobs:
       - name: Install C toolchain for aws-lc-rs
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake nasl nasm musl-tools
+          sudo apt-get install -y --no-install-recommends cmake nasm musl-tools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

@@ -11,7 +11,6 @@ permissions:
   contents: write
 
 env:
-  # aws-lc-sys ships pre-generated nasm objects; use them instead of requiring nasm on every runner.
   AWS_LC_SYS_PREBUILT_NASM: "1"
 
 jobs:
@@ -33,7 +32,7 @@ jobs:
       - name: Install C toolchain for aws-lc-rs
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake nasm musl-tools
+          sudo apt-get install -y --no-install-recommends cmake nasl nasm musl-tools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,20 +46,82 @@ jobs:
       - name: Build (release)
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          set -o pipefail
+          cargo build --release --target ${{ matrix.target }} 2>&1 | tee build-${{ matrix.target }}.log
 
       - name: Inspect binary
+        if: always()
         run: |
           BIN=target/${{ matrix.target }}/release/codex-rec
-          ls -la "$BIN"
+          ls -la "$BIN" || true
           file "$BIN" || true
           ldd "$BIN" || true
 
       - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log-${{ matrix.target }}
+          path: build-${{ matrix.target }}.log
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: ${{ matrix.artifact }}
           path: target/${{ matrix.target }}/release/codex-rec
           if-no-files-found: error
+
+  status:
+    name: publish build status (no token needed)
+    needs: build
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: assets
+
+      - name: Compose status file
+        run: |
+          set -eu
+          {
+            echo "run_id=${{ github.run_id }}"
+            echo "sha=${{ github.sha }}"
+            echo "ref=${{ github.ref }}"
+            echo "date=$(date -u +%FT%TZ)"
+            echo "build_result=${{ needs.build.result }}"
+            for d in assets/*/; do
+              [ -d "$d" ] || continue
+              n=$(basename "$d")
+              if [ -f "$d/codex-rec" ]; then
+                echo "artifact $n: size=$(stat -c%s "$d/codex-rec") sha256=$(sha256sum "$d/codex-rec" | cut -d" " -f1)"
+              fi
+              if [ -f "$d/build-x86_64-unknown-linux-musl.log" ]; then
+                echo "--- tail build-x86_64-unknown-linux-musl.log ---"
+                tail -n 40 "$d/build-x86_64-unknown-linux-musl.log"
+              fi
+              if [ -f "$d/build-x86_64-unknown-linux-gnu.log" ]; then
+                echo "--- tail build-x86_64-unknown-linux-gnu.log ---"
+                tail -n 40 "$d/build-x86_64-unknown-linux-gnu.log"
+              fi
+            done
+          } > ci-status.txt
+          cat ci-status.txt
+
+      - name: Push status to the ci-status branch
+        run: |
+          set -eu
+          rm -rf .git
+          git init -q .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b ci-status
+          git add -f ci-status.txt
+          git commit -q -m "ci status ${GITHUB_SHA}"
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git push -q -f origin ci-status
 
   release:
     name: attach binaries to release
@@ -77,9 +138,11 @@ jobs:
           set -eu
           mkdir -p dist
           for d in assets/*/; do
-            name=$(basename "$d")
-            cp "$d/codex-rec" "dist/$name"
-            chmod +x "dist/$name"
+            n=$(basename "$d")
+            if [ -f "$d/codex-rec" ]; then
+              cp "$d/codex-rec" "dist/$n"
+              chmod +x "dist/$n"
+            fi
           done
           (cd dist && sha256sum ./* > SHA256SUMS.txt)
           ls -la dist

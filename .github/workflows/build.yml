@@ -46,8 +46,13 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
-          set -o pipefail
+          set +e
           cargo build --release --target ${{ matrix.target }} 2>&1 | tee build-${{ matrix.target }}.log
+          code=${PIPESTATUS[0]}
+          echo "cargo_exit_code=$code" | tee -a build-${{ matrix.target }}.log
+          df -h . | tail -1 | tee -a build-${{ matrix.target }}.log
+          free -m | tee -a build-${{ matrix.target }}.log
+          exit $code
 
       - name: Inspect binary
         if: always()
@@ -111,11 +116,11 @@ jobs:
               done
               if [ -f "$d/build-x86_64-unknown-linux-musl.log" ]; then
                 echo "--- tail build-x86_64-unknown-linux-musl.log ---"
-                tail -n 40 "$d/build-x86_64-unknown-linux-musl.log"
+                tail -n 150 "$d/build-x86_64-unknown-linux-musl.log"
               fi
               if [ -f "$d/build-x86_64-unknown-linux-gnu.log" ]; then
                 echo "--- tail build-x86_64-unknown-linux-gnu.log ---"
-                tail -n 40 "$d/build-x86_64-unknown-linux-gnu.log"
+                tail -n 150 "$d/build-x86_64-unknown-linux-gnu.log"
               fi
             done
           } > ci-status.txt

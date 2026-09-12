@@ -1,25 +1,38 @@
 [package]
 name = "codex-rec"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
+description = "Recording + forwarding proxy for the Codex backend, with a configurable device persona"
+license = "Apache-2.0"
 
-# TLS stack = the one the real codex client actually uses on Linux: native-tls / OpenSSL.
-# Measured codex ClientHello = 30 OpenSSL-DEFAULT ciphers (incl. DHE + static RSA), ffdhe groups,
-# renegotiation_info, **no ALPN**, HTTP/1.1. Codex only switches to rustls when a custom CA env
-# (CODEX_CA_CERTIFICATE / SSL_CERT_FILE) is set, so rustls was the wrong target.
-# `openssl/vendored` forces a bundled OpenSSL build (3.5-class, like codex's static binary)
-# instead of whatever the host ships (Debian 12 ships 3.0.20, which has no X25519MLKEM768).
+[features]
+default = ["native-tls-backend"]
+# native-tls / OpenSSL: byte-identical ClientHello to the real codex client (measured JA3 match).
+native-tls-backend = ["reqwest/native-tls", "dep:native-tls"]
+# rustls backend: shuffles ClientHello extension order per connection (rustls feature).
+# OpenSSL has no equivalent option, so `tls.extension_order = "randomize"` needs this feature.
+rustls-backend = ["reqwest/rustls-tls-native-roots", "dep:rustls", "dep:rustls-native-certs", "dep:aws-lc-rs"]
+
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
-reqwest = { version = "0.12.28", default-features = false, features = ["native-tls", "stream"] }
-native-tls = "0.2"
-openssl = { version = "0.10", features = ["vendored"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["stream"] }
+native-tls = { version = "0.2", optional = true }
+rustls = { version = "0.23.36", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8.3", optional = true }
+aws-lc-rs = { version = "1.16.2", optional = true }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 bytes = "1"
 serde_json = "1"
 sha2 = "0.10"
 futures-util = "0.3"
+
+# The Linux codex client bundles a static OpenSSL 3.5-class build; build our own so the
+# ClientHello matches even on distros that ship an older OpenSSL (Debian 12 ships 3.0.20).
+[target.'cfg(not(windows))'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [profile.release]
 opt-level = 2

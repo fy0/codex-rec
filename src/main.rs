@@ -1,29 +1,28 @@
-//! codex-rec: a tiny recording + forwarding HTTP/1.1 reverse proxy for the Codex backend.
+//! codex-rec: a recording + forwarding HTTP/1.1 reverse proxy for the Codex backend.
 //!
-//! Purpose: sit between the real codex client and `https://chatgpt.com` so we can see every
-//! request/response byte, while presenting the *same* TLS fingerprint the real client does
-//! (native-tls / OpenSSL, **no ALPN**, HTTP/1.1 only) — the stack the Linux codex client uses by
-//! default (it only switches to rustls when CODEX_CA_CERTIFICATE/SSL_CERT_FILE is set).
+//! v0.2.0 adds a configurable **device persona** (override-or-inherit per field), TOML
+//! configuration, header rewriting from the config file and a TLS extension-order switch.
 //!
-//! Recording layout (under --log-dir):
-//!   index.jsonl            one compact line per request/response
-//!   req-<stamp>.hdr        request line + headers (authorization redacted)
-//!   req-<stamp>.body       raw request body as received
-//!   req-<stamp>.json       decompressed body (zstd handled through the `zstd` CLI) + extracted fields
-//!   req-<stamp>.summary.json
-//!   resp-<stamp>.hdr       status line + headers (with the __oailb origin host decoded)
-//!   resp-<stamp>.sse       raw response body as it streamed
-//!   resp-<stamp>.summary.json  model / service_tier / response ids / error events / answer text
+//! TLS: the Linux codex client uses native-tls / a bundled OpenSSL and sends **no ALPN**, so
+//! the default backend here reproduces that ClientHello byte-for-byte (measured JA3
+//! `0b85eb0d4981e69064e40753e4f0ac5f` with SNI, `23211f2b48104c7030b93680a2efcfd0` without).
+//! `tls.extension_order = "randomize"` switches to the rustls backend, whose ClientHello shuffles
+//! the extension order per connection (OpenSSL has no such option).
 //!
-//! Optional rewriting (all off by default):
-//!   --drop-req-header name[,name]     --set-req-header name=value[;name=value]
-//!   --drop-res-header name[,name]     --set-res-header name=value[;name=value]
-//!   --drop-body-key key[,key]         --set-body-key key=json[;key=json]
-//!   --rewrite-catalog                 force use_responses_lite=false and service_tiers=[] in /models
-//!
-//! Build: cargo build --release   (needs a C toolchain for aws-lc-rs)
+//! Recording layout (under `log_dir`):
+//!   index.jsonl               one compact line per request/response
+//!   req-<stamp>.hdr           incoming request line + headers (secrets redacted)
+//!   req-<stamp>.out.hdr       what we actually sent upstream (after persona + rewrites)
+//!   req-<stamp>.body/.json    raw and decompressed request body
+//!   req-<stamp>.summary.json  model / service_tier / effort / instructions / client_metadata
+//!   resp-<stamp>.hdr          status + headers, with the __oailb origin host decoded
+//!   resp-<stamp>.sse          raw streamed response
+//!   resp-<stamp>.summary.json model(s) seen / service_tier(s) / response ids / errors / answer
 
-use std::collections::HashMap;
+mod config;
+mod persona;
+
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -44,6 +43,8 @@ use futures_util::Stream;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use config::{Config, ExtensionOrder};
+
 const MAX_BODY: usize = 64 * 1024 * 1024;
 const MAX_ACC: usize = 32 * 1024 * 1024;
 const HOP_BY_HOP: &[&str] = &[
@@ -56,93 +57,23 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
-#[derive(Clone)]
-struct Cfg {
-    upstream: String,
-    log_dir: PathBuf,
-    drop_req: Vec<String>,
-    set_req: Vec<(String, String)>,
-    drop_res: Vec<String>,
-    set_res: Vec<(String, String)>,
-    body_drop: Vec<String>,
-    body_set: Vec<(String, String)>,
-    rewrite_catalog: bool,
-}
-
-impl Cfg {
-    fn from_args() -> Cfg {
-        let args: Vec<String> = env::args().skip(1).collect();
-        let mut map: HashMap<String, String> = HashMap::new();
-        let mut flags: Vec<String> = Vec::new();
-        let mut i = 0;
-        while i < args.len() {
-            if let Some(rest) = args[i].strip_prefix("--") {
-                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
-                    map.insert(rest.to_owned(), args[i + 1].clone());
-                    i += 2;
-                } else {
-                    flags.push(rest.to_owned());
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-        }
-        let list = |k: &str| -> Vec<String> {
-            map.get(k)
-                .map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect())
-                .unwrap_or_default()
-        };
-        let pairs = |k: &str| -> Vec<(String, String)> {
-            map.get(k)
-                .map(|v| {
-                    v.split(';')
-                        .filter_map(|kv| kv.split_once('='))
-                        .map(|(a, b)| (a.trim().to_ascii_lowercase(), b.trim().to_owned()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        let listen = map.get("listen").cloned().unwrap_or_else(|| "127.0.0.1:18080".to_owned());
-        env::set_var("CODEX_REC_LISTEN", listen);
-        Cfg {
-            upstream: map.get("upstream").cloned().unwrap_or_else(|| "https://chatgpt.com".to_owned()),
-            log_dir: PathBuf::from(map.get("log-dir").cloned().unwrap_or_else(|| "/root/rec".to_owned())),
-            drop_req: list("drop-req-header"),
-            set_req: pairs("set-req-header"),
-            drop_res: list("drop-res-header"),
-            set_res: pairs("set-res-header"),
-            body_drop: map
-                .get("drop-body-key")
-                .map(|v| v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect())
-                .unwrap_or_default(),
-            body_set: map
-                .get("set-body-key")
-                .map(|v| {
-                    v.split(';')
-                        .filter_map(|kv| kv.split_once('='))
-                        .map(|(a, b)| (a.trim().to_owned(), b.trim().to_owned()))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            rewrite_catalog: flags.iter().any(|f| f == "rewrite-catalog"),
-        }
-    }
+struct App {
+    cfg: Config,
+    client: reqwest::Client,
 }
 
 // ---------------------------------------------------------------- helpers
 
-fn now_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
-}
+static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn stamp() -> String {
-    let n = now_ms();
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{n}-{seq}")
 }
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn redact(name: &str, value: &str) -> String {
     let n = name.to_ascii_lowercase();
@@ -153,7 +84,7 @@ fn redact(name: &str, value: &str) -> String {
     value.to_owned()
 }
 
-/// Run the system `zstd` CLI: `mode` is either "-d" (decompress) or "-3" (compress).
+/// Runs the system `zstd` CLI (`mode` is `-d` or `-3`).
 fn zstd_cli(mode: &str, input: &[u8]) -> Option<Vec<u8>> {
     let mut child = Command::new("zstd")
         .arg(mode)
@@ -164,13 +95,11 @@ fn zstd_cli(mode: &str, input: &[u8]) -> Option<Vec<u8>> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    // Feed stdin from a thread: writing a big body while zstd fills its stdout pipe would
-    // otherwise dead-lock both sides.
-    let mut si = child.stdin.take()?;
+    let mut stdin = child.stdin.take()?;
     let data = input.to_vec();
     let feeder = std::thread::spawn(move || {
-        let _ = si.write_all(&data);
-        drop(si);
+        let _ = stdin.write_all(&data);
+        drop(stdin);
     });
     let out = child.wait_with_output().ok()?;
     let _ = feeder.join();
@@ -191,36 +120,7 @@ fn decode_body(raw: &[u8], cenc: Option<&str>) -> Option<Vec<u8>> {
 fn short_hash(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    let d = h.finalize();
-    d.iter().take(6).map(|b| format!("{b:02x}")).collect()
-}
-
-fn decode_oailb(headers: &[String]) -> Option<String> {
-    for h in headers {
-        let lower = h.to_ascii_lowercase();
-        if !lower.contains("__oailb=") {
-            continue;
-        }
-        let start = lower.find("__oailb=")? + "__oailb=".len();
-        let rest = &h[start..];
-        let end = rest.find(|c: char| c == ';' || c == ' ' || c == '\r').unwrap_or(rest.len());
-        let token = &rest[..end];
-        let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let mut p = parts[1].replace('-', "+").replace('_', "/");
-        while p.len() % 4 != 0 {
-            p.push('=');
-        }
-        let decoded = base64_decode(&p)?;
-        if let Ok(v) = serde_json::from_slice::<Value>(&decoded) {
-            if let Some(host) = v.get("host").and_then(|h| h.as_str()) {
-                return Some(host.to_owned());
-            }
-        }
-    }
-    None
+    h.finalize().iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
@@ -247,10 +147,36 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-// ---------------------------------------------------------------- extraction
+/// Decodes the `__oailb` cookie that Cloudflare sets: it names the origin pool in use.
+fn decode_oailb(headers: &[String]) -> Option<String> {
+    for h in headers {
+        let lower = h.to_ascii_lowercase();
+        let Some(start) = lower.find("__oailb=") else { continue };
+        let rest = &h[start + "__oailb=".len()..];
+        let end = rest.find(|c: char| c == ';' || c == ' ' || c == '\r').unwrap_or(rest.len());
+        let parts: Vec<&str> = rest[..end].split('.').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let mut payload = parts[1].replace('-', "+").replace('_', "/");
+        while payload.len() % 4 != 0 {
+            payload.push('=');
+        }
+        if let Some(decoded) = base64_decode(&payload) {
+            if let Ok(v) = serde_json::from_slice::<Value>(&decoded) {
+                if let Some(host) = v.get("host").and_then(|h| h.as_str()) {
+                    return Some(host.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------- summaries
 
 fn summarize_request(body: &Value) -> Value {
-    let mut kinds: HashMap<String, usize> = HashMap::new();
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
     let mut msg_chars = 0usize;
     let mut last_user = String::new();
     if let Some(items) = body.get("input").and_then(|v| v.as_array()) {
@@ -262,25 +188,17 @@ fn summarize_request(body: &Value) -> Value {
                 .unwrap_or("?")
                 .to_owned();
             *kinds.entry(kind).or_insert(0) += 1;
-            if it.get("role").and_then(|v| v.as_str()) == Some("user") {
-                let mut txt = String::new();
-                if let Some(cs) = it.get("content").and_then(|v| v.as_array()) {
-                    for c in cs {
-                        if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
-                            txt.push_str(t);
-                        }
+            let mut text = String::new();
+            if let Some(parts) = it.get("content").and_then(|v| v.as_array()) {
+                for c in parts {
+                    if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+                        text.push_str(t);
                     }
                 }
-                msg_chars += txt.len();
-                if !txt.is_empty() {
-                    last_user = txt.chars().take(400).collect();
-                }
-            } else if let Some(t) = it.get("content").and_then(|v| v.as_array()) {
-                for c in t {
-                    if let Some(txt) = c.get("text").and_then(|v| v.as_str()) {
-                        msg_chars += txt.len();
-                    }
-                }
+            }
+            msg_chars += text.len();
+            if it.get("role").and_then(|v| v.as_str()) == Some("user") && !text.is_empty() {
+                last_user = text.chars().take(400).collect();
             }
         }
     }
@@ -297,7 +215,10 @@ fn summarize_request(body: &Value) -> Value {
         "items": body.get("input").and_then(|v| v.as_array()).map(|a| a.len()),
         "item_kinds": kinds,
         "message_chars": msg_chars,
-        "client_metadata_keys": body.get("client_metadata").and_then(|v| v.as_object()).map(|o| o.keys().cloned().collect::<Vec<_>>()),
+        "client_metadata_keys": body
+            .get("client_metadata")
+            .and_then(|v| v.as_object())
+            .map(|o| o.keys().cloned().collect::<Vec<_>>()),
         "last_user": last_user,
     })
 }
@@ -306,16 +227,13 @@ fn summarize_response(text: &str) -> Value {
     let mut models: Vec<String> = Vec::new();
     let mut tiers: Vec<String> = Vec::new();
     let mut ids: Vec<String> = Vec::new();
-    let mut events: HashMap<String, usize> = HashMap::new();
+    let mut events: BTreeMap<String, usize> = BTreeMap::new();
     let mut errors: Vec<String> = Vec::new();
-    let mut answer = String::new();
     let mut metadata_frames: Vec<String> = Vec::new();
+    let mut answer = String::new();
     for line in text.lines() {
         let t = line.trim();
-        if !t.starts_with('{') && !t.starts_with("event:") {
-            continue;
-        }
-        if t.starts_with("event:") {
+        if !t.starts_with('{') {
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(t) else { continue };
@@ -328,6 +246,11 @@ fn summarize_response(text: &str) -> Value {
             }
             if ty.contains("error") || ty.contains("failed") {
                 errors.push(t.chars().take(300).collect());
+            }
+            if ty == "response.output_text.delta" {
+                if let Some(d) = v.get("delta").and_then(|x| x.as_str()) {
+                    answer.push_str(d);
+                }
             }
         }
         if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
@@ -347,11 +270,6 @@ fn summarize_response(text: &str) -> Value {
                 }
             }
         }
-        if v.get("type").and_then(|x| x.as_str()) == Some("response.output_text.delta") {
-            if let Some(d) = v.get("delta").and_then(|x| x.as_str()) {
-                answer.push_str(d);
-            }
-        }
     }
     json!({
         "models_seen": models,
@@ -365,18 +283,27 @@ fn summarize_response(text: &str) -> Value {
     })
 }
 
-// ---------------------------------------------------------------- recording sink
+fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(line.as_bytes())?;
+    f.write_all(b"\n")
+}
+
+fn header_dump(lines: &[String]) -> String {
+    format!("{}\n", lines.join("\n"))
+}
+
+// ---------------------------------------------------------------- tee
 
 struct Sink {
     file: Option<File>,
     acc: Vec<u8>,
     prefix: String,
-    cfg: Arc<Cfg>,
+    log_dir: PathBuf,
     req_stamp: String,
     status: u16,
-    #[allow(dead_code)]
-    resp_headers: Vec<String>,
     origin: Option<String>,
+    persona: Vec<String>,
 }
 
 impl Sink {
@@ -392,12 +319,15 @@ impl Sink {
     fn finish(&mut self) {
         let text = String::from_utf8_lossy(&self.acc).to_string();
         let summary = summarize_response(&text);
-        let path = self.cfg.log_dir.join(format!("resp-{}.summary.json", self.prefix));
-        let _ = fs::write(&path, serde_json::to_vec_pretty(&summary).unwrap_or_default());
+        let _ = fs::write(
+            self.log_dir.join(format!("resp-{}.summary.json", self.prefix)),
+            serde_json::to_vec_pretty(&summary).unwrap_or_default(),
+        );
         let line = json!({
             "req": self.req_stamp,
             "status": self.status,
             "origin": self.origin,
+            "persona": self.persona,
             "models_seen": summary.get("models_seen"),
             "service_tiers_seen": summary.get("service_tiers_seen"),
             "response_ids": summary.get("response_ids"),
@@ -405,14 +335,8 @@ impl Sink {
             "errors": summary.get("errors"),
             "answer_chars": summary.get("answer_chars"),
         });
-        let _ = append_line(&self.cfg.log_dir.join("index.jsonl"), &line.to_string());
+        let _ = append_line(&self.log_dir.join("index.jsonl"), &line.to_string());
     }
-}
-
-fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")
 }
 
 struct TeeStream {
@@ -458,10 +382,19 @@ impl Stream for TeeStream {
 
 // ---------------------------------------------------------------- handler
 
-async fn handle(State(cfg): State<Arc<Cfg>>, req: axum::extract::Request) -> Response {
+fn text_response(code: u16, msg: &str) -> Response {
+    Response::builder()
+        .status(code)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(msg.to_owned()))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Response {
+    let cfg = &app.cfg;
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
-    let uri = parts.uri.clone();
+    let mut uri = parts.uri.to_string();
     let req_stamp = stamp();
     let prefix = req_stamp.clone();
 
@@ -470,71 +403,86 @@ async fn handle(State(cfg): State<Arc<Cfg>>, req: axum::extract::Request) -> Res
         Err(e) => return text_response(400, &format!("body read error: {e}")),
     };
 
-    // ---- record request
-    let mut hdr_lines: Vec<String> = Vec::new();
+    // ---- incoming request capture + outgoing header assembly
+    let mut incoming_lines: Vec<String> = Vec::new();
     let mut out_headers = reqwest::header::HeaderMap::new();
     let mut cenc = None;
     for (k, v) in parts.headers.iter() {
         let name = k.as_str().to_ascii_lowercase();
-        let val = v.to_str().unwrap_or("<non-utf8>").to_owned();
-        hdr_lines.push(format!("{name}: {}", redact(&name, &val)));
+        let value = v.to_str().unwrap_or("<non-utf8>").to_owned();
+        incoming_lines.push(format!("{name}: {}", redact(&name, &value)));
         if name == "content-encoding" {
-            cenc = Some(val.clone());
+            cenc = Some(value.clone());
         }
-        if HOP_BY_HOP.contains(&name.as_str()) || cfg.drop_req.contains(&name) {
+        if HOP_BY_HOP.contains(&name.as_str()) || cfg.request_rules.drop.contains(&name) {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
             reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-            reqwest::header::HeaderValue::from_str(&val),
+            reqwest::header::HeaderValue::from_str(&value),
         ) {
             out_headers.insert(hn, hv);
-        }
-    }
-    for (k, v) in cfg.set_req.iter() {
-        if let (Ok(hn), Ok(hv)) = (
-            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-            reqwest::header::HeaderValue::from_str(v),
-        ) {
-            out_headers.insert(hn, hv);
-            hdr_lines.push(format!("{k}: {v}   <- injected"));
         }
     }
     let _ = fs::write(
         cfg.log_dir.join(format!("req-{req_stamp}.hdr")),
-        format!("{method} {uri}\n{}\n", hdr_lines.join("\n")),
+        format!("{method} {uri}\n{}", header_dump(&incoming_lines)),
     );
     let _ = fs::write(cfg.log_dir.join(format!("req-{req_stamp}.body")), &body_bytes);
 
-    // ---- body rewriting (JSON only; zstd handled via the CLI)
+    // ---- device persona (override-or-inherit) then configured header rewrites
+    let persona_notes = persona::apply(cfg, &mut out_headers, &mut uri);
+    let mut out_lines: Vec<String> = vec![format!("{method} {uri}")];
+    for (name, value) in cfg.request_rules.set.iter() {
+        if let (Ok(hn), Ok(hv)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            out_headers.insert(hn, hv);
+            out_lines.push(format!("{name}: {value}   <- set by config"));
+        }
+    }
+    for (k, v) in out_headers.iter() {
+        let name = k.as_str().to_ascii_lowercase();
+        if cfg.request_rules.set.keys().any(|s| s.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
+        out_lines.push(format!("{name}: {}", redact(&name, v.to_str().unwrap_or("<non-utf8>"))));
+    }
+    for note in persona_notes.iter() {
+        out_lines.push(format!("# persona: {note}"));
+    }
+    let _ = fs::write(cfg.log_dir.join(format!("req-{req_stamp}.out.hdr")), header_dump(&out_lines));
+
+    // ---- optional body rewriting (JSON only; zstd via the CLI)
     let mut body_out = body_bytes.to_vec();
     if !cfg.body_drop.is_empty() || !cfg.body_set.is_empty() {
         match decode_body(&body_bytes, cenc.as_deref()) {
-            Some(decoded) => {
-                match serde_json::from_slice::<Value>(&decoded) {
-                    Ok(mut v) if v.is_object() => {
-                        let obj = v.as_object_mut().unwrap();
-                        for k in cfg.body_drop.iter() {
-                            obj.remove(k);
-                        }
-                        for (k, raw) in cfg.body_set.iter() {
-                            let parsed = serde_json::from_str::<Value>(raw).unwrap_or(Value::String(raw.clone()));
-                            obj.insert(k.clone(), parsed);
-                        }
-                        let new = serde_json::to_vec(&v).unwrap_or_default();
-                        body_out = match cenc {
-                            Some(_) => zstd_cli("-3", &new).unwrap_or(new),
-                            None => new,
-                        };
+            Some(decoded) => match serde_json::from_slice::<Value>(&decoded) {
+                Ok(mut v) if v.is_object() => {
+                    let obj = v.as_object_mut().unwrap();
+                    for k in cfg.body_drop.iter() {
+                        obj.remove(k);
                     }
-                    _ => eprintln!("[body rewrite skipped] body is not a JSON object"),
+                    for (k, raw) in cfg.body_set.iter() {
+                        let parsed =
+                            serde_json::from_str::<Value>(raw).unwrap_or(Value::String(raw.clone()));
+                        obj.insert(k.clone(), parsed);
+                    }
+                    let new = serde_json::to_vec(&v).unwrap_or_default();
+                    body_out = if cenc.is_some() {
+                        zstd_cli("-3", &new).unwrap_or(new)
+                    } else {
+                        new
+                    };
                 }
-            }
+                _ => eprintln!("[body rewrite skipped] body is not a JSON object"),
+            },
             None => eprintln!("[body rewrite skipped] could not decode body"),
         }
     }
 
-    // ---- request body extras
+    // ---- request body recording
     if let Some(decoded) = decode_body(&body_bytes, cenc.as_deref()) {
         let _ = fs::write(cfg.log_dir.join(format!("req-{req_stamp}.json")), &decoded);
         if let Ok(v) = serde_json::from_slice::<Value>(&decoded) {
@@ -543,15 +491,23 @@ async fn handle(State(cfg): State<Arc<Cfg>>, req: axum::extract::Request) -> Res
                 cfg.log_dir.join(format!("req-{req_stamp}.summary.json")),
                 serde_json::to_vec_pretty(&summary).unwrap_or_default(),
             );
-            let line = json!({"req": req_stamp, "method": method.to_string(), "uri": uri.to_string(), "request": summary});
+            let line = json!({
+                "req": req_stamp,
+                "method": method.to_string(),
+                "uri": uri.clone(),
+                "persona": persona_notes.clone(),
+                "request": summary,
+            });
             let _ = append_line(&cfg.log_dir.join("index.jsonl"), &line.to_string());
         }
     }
 
     // ---- forward
     let url = format!("{}{}", cfg.upstream, uri);
-    let client = CLIENT.get_or_init(build_client);
-    let mut builder = client.request(method.clone(), &url).headers(out_headers);
+    let mut builder = app
+        .client
+        .request(method.clone(), &url)
+        .headers(out_headers);
     if !body_out.is_empty() {
         builder = builder.body(body_out);
     }
@@ -561,15 +517,15 @@ async fn handle(State(cfg): State<Arc<Cfg>>, req: axum::extract::Request) -> Res
     };
 
     let status = resp.status();
-    let mut resp_hdr_lines: Vec<String> = vec![format!("HTTP {}", status.as_u16())];
+    let mut resp_lines: Vec<String> = vec![format!("HTTP {}", status.as_u16())];
     let mut rb = Response::builder().status(status);
     if let Some(hs) = rb.headers_mut() {
         for (k, v) in resp.headers().iter() {
             let name = k.as_str().to_ascii_lowercase();
-            let val = v.to_str().unwrap_or("<non-utf8>").to_owned();
-            resp_hdr_lines.push(format!("{name}: {val}"));
+            let value = v.to_str().unwrap_or("<non-utf8>").to_owned();
+            resp_lines.push(format!("{name}: {value}"));
             if HOP_BY_HOP.contains(&name.as_str())
-                || cfg.drop_res.contains(&name)
+                || cfg.response_rules.drop.contains(&name)
                 || name == "content-length"
                 || name == "transfer-encoding"
             {
@@ -577,32 +533,29 @@ async fn handle(State(cfg): State<Arc<Cfg>>, req: axum::extract::Request) -> Res
             }
             if let (Ok(hn), Ok(hv)) = (
                 reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-                reqwest::header::HeaderValue::from_str(&val),
+                reqwest::header::HeaderValue::from_str(&value),
             ) {
                 hs.insert(hn, hv);
             }
         }
-        for (k, v) in cfg.set_res.iter() {
+        for (name, value) in cfg.response_rules.set.iter() {
             if let (Ok(hn), Ok(hv)) = (
-                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                reqwest::header::HeaderValue::from_str(v),
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
             ) {
                 hs.insert(hn, hv);
-                resp_hdr_lines.push(format!("{k}: {v}   <- injected"));
+                resp_lines.push(format!("{name}: {value}   <- set by config"));
             }
         }
     }
-    let origin = decode_oailb(&resp_hdr_lines);
+    let origin = decode_oailb(&resp_lines);
     if let Some(o) = origin.as_ref() {
-        resp_hdr_lines.push(format!("[decoded] __oailb origin = {o}"));
+        resp_lines.push(format!("[decoded] __oailb origin = {o}"));
     }
-    let _ = fs::write(
-        cfg.log_dir.join(format!("resp-{prefix}.hdr")),
-        resp_hdr_lines.join("\n"),
-    );
+    let _ = fs::write(cfg.log_dir.join(format!("resp-{prefix}.hdr")), header_dump(&resp_lines));
 
-    // ---- catalog rewrite (buffered, non-streaming GET /models)
-    if cfg.rewrite_catalog && uri.path().contains("/models") {
+    // ---- optional catalog rewrite (buffered, non-streaming)
+    if cfg.rewrite_catalog && uri.contains("/models") {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => return text_response(502, &format!("upstream read error: {e}")),
@@ -635,12 +588,12 @@ async fn handle(State(cfg): State<Arc<Cfg>>, req: axum::extract::Request) -> Res
     let sink = Arc::new(Mutex::new(Sink {
         file,
         acc: Vec::new(),
-        prefix: prefix.clone(),
-        cfg: Arc::clone(&cfg),
+        prefix,
+        log_dir: cfg.log_dir.clone(),
         req_stamp,
         status: status.as_u16(),
-        resp_headers: resp_hdr_lines,
         origin,
+        persona: persona_notes,
     }));
     let stream = TeeStream {
         inner: Box::pin(resp.bytes_stream()),
@@ -651,45 +604,112 @@ async fn handle(State(cfg): State<Arc<Cfg>>, req: axum::extract::Request) -> Res
         .unwrap_or_else(|_| text_response(500, "response build error"))
 }
 
-fn text_response(code: u16, msg: &str) -> Response {
-    Response::builder()
-        .status(code)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Body::from(msg.to_owned()))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
-}
+// ---------------------------------------------------------------- upstream TLS
 
-static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-
-fn build_client() -> reqwest::Client {
-    // codex on Linux = reqwest + native-tls (bundled OpenSSL) with no ALPN and HTTP/1.1.
-    // Mirror exactly that, so the upstream ClientHello matches codex's.
-    // NOTE: reqwest only configures ALPN on its rustls path; with native-tls it leaves ALPN
-    // unset, which is exactly why the real codex client sends no ALPN extension either.
-    let tls = native_tls::TlsConnector::builder()
-        .build()
-        .expect("failed to build native-tls connector");
+fn base_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
         .redirect(reqwest::redirect::Policy::none())
         .http1_only()
         .pool_max_idle_per_host(2)
+}
+
+/// native-tls / OpenSSL, no ALPN, HTTP/1.1: matches the measured codex ClientHello.
+#[cfg(feature = "native-tls-backend")]
+fn build_native_tls_client() -> reqwest::Client {
+    let tls = native_tls::TlsConnector::builder()
+        .build()
+        .expect("failed to build native-tls connector");
+    base_builder()
+        .use_preconfigured_tls(tls)
         .build()
         .expect("failed to build reqwest client")
 }
 
+#[cfg(not(feature = "native-tls-backend"))]
+fn build_native_tls_client() -> reqwest::Client {
+    base_builder().build().expect("failed to build reqwest client")
+}
+
+/// rustls + aws-lc-rs (prefer-post-quantum), no ALPN: rustls shuffles the extension order per
+/// connection, which is what `tls.extension_order = "randomize"` is for.
+#[cfg(feature = "rustls-backend")]
+fn build_rustls_client() -> reqwest::Client {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = roots.add(cert);
+    }
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols.clear();
+    base_builder()
+        .use_preconfigured_tls(tls)
+        .build()
+        .expect("failed to build reqwest client")
+}
+
+fn build_client(cfg: &Config) -> reqwest::Client {
+    match cfg.extension_order {
+        ExtensionOrder::Fixed => {
+            println!("tls: native-tls/OpenSSL, fixed extension order (matches codex)");
+            build_native_tls_client()
+        }
+        ExtensionOrder::Randomize => {
+            #[cfg(feature = "rustls-backend")]
+            {
+                println!("tls: rustls backend, extension order randomized per connection");
+                build_rustls_client()
+            }
+            #[cfg(not(feature = "rustls-backend"))]
+            {
+                eprintln!("tls: rustls-backend not compiled in; using native-tls (fixed order)");
+                build_native_tls_client()
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let cfg = Arc::new(Cfg::from_args());
+    let (cfg, warnings) = match config::load() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("config error: {e}");
+            std::process::exit(2);
+        }
+    };
     fs::create_dir_all(&cfg.log_dir).expect("cannot create log dir");
-    let listen = env::var("CODEX_REC_LISTEN").unwrap_or_else(|_| "127.0.0.1:18080".to_owned());
-    let app = Router::new().fallback(any(handle)).with_state(Arc::clone(&cfg));
-    let listener = tokio::net::TcpListener::bind(&listen).await.expect("bind failed");
-    println!("codex-rec listening on http://{listen} -> {}", cfg.upstream);
-    println!("recording into {}", cfg.log_dir.display());
+
     println!(
-        "config: drop_req={:?} set_req={:?} drop_res={:?} set_res={:?} body_drop={:?} catalog_rewrite={}",
-        cfg.drop_req, cfg.set_req, cfg.drop_res, cfg.set_res, cfg.body_drop, cfg.rewrite_catalog
+        "codex-rec {} listening on http://{} -> {}",
+        env!("CARGO_PKG_VERSION"),
+        cfg.listen,
+        cfg.upstream
     );
-    axum::serve(listener, app).await.expect("server error");
+    println!("recording into {}", cfg.log_dir.display());
+    if let Some(p) = cfg.config_path.as_ref() {
+        println!("config file: {}", p.display());
+    }
+    println!(
+        "persona: originator={:?} codex_version={:?} os={:?} arch={:?} terminal={:?} user_agent={:?} rewrite_client_version={}",
+        cfg.persona.originator,
+        cfg.persona.codex_version,
+        cfg.persona.os,
+        cfg.persona.arch,
+        cfg.persona.terminal,
+        cfg.persona.user_agent,
+        cfg.persona.rewrite_client_version
+    );
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
+
+    let client = build_client(&cfg);
+    let app = Arc::new(App { cfg, client });
+    let listen = app.cfg.listen.clone();
+    let router = Router::new().fallback(any(handle)).with_state(Arc::clone(&app));
+    let listener = tokio::net::TcpListener::bind(&listen).await.expect("bind failed");
+    axum::serve(listener, router).await.expect("server error");
 }

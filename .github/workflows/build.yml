@@ -11,24 +11,30 @@ permissions:
   contents: write
 
 env:
+  # aws-lc-sys ships pre-generated nasm objects; avoids requiring nasm for every target.
   AWS_LC_SYS_PREBUILT_NASM: "1"
 
 jobs:
   build:
     name: build ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
             artifact: codex-rec-x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-
+            features: native-tls-backend,rustls-backend
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: codex-rec-x86_64-pc-windows-msvc
+            features: native-tls-backend
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install C toolchain for aws-lc-rs
+      - name: Install C toolchain for vendored OpenSSL / aws-lc-rs (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake nasm musl-tools
@@ -40,22 +46,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-${{ matrix.features }}
 
       - name: Build (release)
+        shell: bash
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           set +e
-          cargo build --release --target ${{ matrix.target }} 2>&1 | tee build-${{ matrix.target }}.log
+          cargo build --release --target ${{ matrix.target }} \
+            --no-default-features --features ${{ matrix.features }} \
+            2>&1 | tee build-${{ matrix.target }}.log
           code=${PIPESTATUS[0]}
           echo "cargo_exit_code=$code" | tee -a build-${{ matrix.target }}.log
-          df -h . | tail -1 | tee -a build-${{ matrix.target }}.log
-          free -m | tee -a build-${{ matrix.target }}.log
           exit $code
 
-      - name: Inspect binary
-        if: always()
+      - name: Test (persona + config unit tests)
+        shell: bash
+        run: |
+          set +e
+          cargo test --release --target ${{ matrix.target }} \
+            --no-default-features --features ${{ matrix.features }} 2>&1 | tail -30
+
+      - name: Inspect binary (Linux)
+        if: runner.os == 'Linux'
         run: |
           BIN=target/${{ matrix.target }}/release/codex-rec
           ls -la "$BIN" || true
@@ -67,6 +81,14 @@ jobs:
           else
             echo "max_glibc=missing" > glibc-${{ matrix.target }}.txt
           fi
+
+      - name: Inspect binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/codex-rec.exe
+          ls -la "$BIN" || true
+          echo "max_glibc=n/a (windows)" > glibc-${{ matrix.target }}.txt
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -81,7 +103,9 @@ jobs:
         if: success()
         with:
           name: ${{ matrix.artifact }}
-          path: target/${{ matrix.target }}/release/codex-rec
+          path: |
+            target/${{ matrix.target }}/release/codex-rec
+            target/${{ matrix.target }}/release/codex-rec.exe
           if-no-files-found: error
 
   status:
@@ -108,20 +132,20 @@ jobs:
             for d in assets/*/; do
               [ -d "$d" ] || continue
               n=$(basename "$d")
-              if [ -f "$d/codex-rec" ]; then
-                echo "artifact $n: size=$(stat -c%s "$d/codex-rec") sha256=$(sha256sum "$d/codex-rec" | cut -d" " -f1)"
-              fi
+              for f in "$d"/codex-rec*; do
+                if [ -f "$f" ]; then
+                  echo "artifact $n: size=$(stat -c%s "$f") sha256=$(sha256sum "$f" | cut -d' ' -f1)"
+                fi
+              done
               for g in "$d"/glibc-*.txt; do
                 if [ -f "$g" ]; then echo "artifact $n: $(cat "$g")"; fi
               done
-              if [ -f "$d/build-x86_64-unknown-linux-musl.log" ]; then
-                echo "--- tail build-x86_64-unknown-linux-musl.log ---"
-                tail -n 150 "$d/build-x86_64-unknown-linux-musl.log"
-              fi
-              if [ -f "$d/build-x86_64-unknown-linux-gnu.log" ]; then
-                echo "--- tail build-x86_64-unknown-linux-gnu.log ---"
-                tail -n 150 "$d/build-x86_64-unknown-linux-gnu.log"
-              fi
+              for l in "$d"/build-*.log; do
+                if [ -f "$l" ]; then
+                  echo "--- tail $(basename "$l") ---"
+                  tail -n 120 "$l"
+                fi
+              done
             done
           } > ci-status.txt
           cat ci-status.txt
@@ -155,10 +179,12 @@ jobs:
           mkdir -p dist
           for d in assets/*/; do
             n=$(basename "$d")
-            if [ -f "$d/codex-rec" ]; then
-              cp "$d/codex-rec" "dist/$n"
-              chmod +x "dist/$n"
-            fi
+            for f in "$d"/codex-rec*; do
+              [ -f "$f" ] || continue
+              base=$(basename "$f")
+              cp "$f" "dist/$n${base#codex-rec}"
+              chmod +x "dist/$n${base#codex-rec}"
+            done
           done
           (cd dist && sha256sum ./* > SHA256SUMS.txt)
           ls -la dist

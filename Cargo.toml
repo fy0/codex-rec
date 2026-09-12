@@ -4,16 +4,18 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# TLS stack pinned to what the real codex client uses (rustls 0.23.36 + aws-lc-rs 1.16.2 +
-# prefer-post-quantum) so our ClientHello can match byte-for-byte. ALPN is cleared and HTTP/1.1
-# is forced, because the measured codex ClientHello carries no ALPN at all.
+# TLS stack = the one the real codex client actually uses on Linux: native-tls / OpenSSL.
+# Measured codex ClientHello = 30 OpenSSL-DEFAULT ciphers (incl. DHE + static RSA), ffdhe groups,
+# renegotiation_info, **no ALPN**, HTTP/1.1. Codex only switches to rustls when a custom CA env
+# (CODEX_CA_CERTIFICATE / SSL_CERT_FILE) is set, so rustls was the wrong target.
+# `openssl/vendored` forces a bundled OpenSSL build (3.5-class, like codex's static binary)
+# instead of whatever the host ships (Debian 12 ships 3.0.20, which has no X25519MLKEM768).
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
-reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
-rustls = { version = "0.23.36", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }
-rustls-native-certs = "0.8.3"
-aws-lc-rs = "1.16.2"
+reqwest = { version = "0.12.28", default-features = false, features = ["native-tls", "stream"] }
+native-tls = "0.2"
+openssl = { version = "0.10", features = ["vendored"] }
 bytes = "1"
 serde_json = "1"
 sha2 = "0.10"

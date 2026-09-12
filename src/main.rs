@@ -2,7 +2,8 @@
 //!
 //! Purpose: sit between the real codex client and `https://chatgpt.com` so we can see every
 //! request/response byte, while presenting the *same* TLS fingerprint the real client does
-//! (rustls 0.23.36 + aws-lc-rs, prefer-post-quantum, **no ALPN**, HTTP/1.1 only).
+//! (native-tls / OpenSSL, **no ALPN**, HTTP/1.1 only) — the stack the Linux codex client uses by
+//! default (it only switches to rustls when CODEX_CA_CERTIFICATE/SSL_CERT_FILE is set).
 //!
 //! Recording layout (under --log-dir):
 //!   index.jsonl            one compact line per request/response
@@ -40,7 +41,6 @@ use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
 use futures_util::Stream;
-use rustls::{ClientConfig, RootCertStore};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -662,20 +662,14 @@ fn text_response(code: u16, msg: &str) -> Response {
 static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
 fn build_client() -> reqwest::Client {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let mut roots = RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    for c in native.certs {
-        let _ = roots.add(c);
-    }
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    // The real codex ClientHello carries no ALPN extension at all; keep it empty so the
-    // upstream sees the same handshake shape (and therefore the same JA3).
-    config.alpn_protocols.clear();
+    // codex on Linux = reqwest + native-tls (bundled OpenSSL) with no ALPN and HTTP/1.1.
+    // Mirror exactly that, so the upstream ClientHello matches codex's.
+    let tls = native_tls::TlsConnector::builder()
+        .request_alpns(&[] as &[&str])
+        .build()
+        .expect("failed to build native-tls connector");
     reqwest::Client::builder()
-        .use_preconfigured_tls(config)
+        .use_preconfigured_tls(tls)
         .redirect(reqwest::redirect::Policy::none())
         .http1_only()
         .pool_max_idle_per_host(2)

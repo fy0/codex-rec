@@ -16,15 +16,17 @@ env:
 jobs:
   build:
     name: build ${{ matrix.target }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             artifact: codex-rec-x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
           - target: x86_64-unknown-linux-gnu
             artifact: codex-rec-x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v4
@@ -57,12 +59,20 @@ jobs:
           ls -la "$BIN" || true
           file "$BIN" || true
           ldd "$BIN" || true
+          if [ -f "$BIN" ]; then
+            MAX=$(grep -ao 'GLIBC_2\.[0-9]*' "$BIN" | sort -Vu | tail -1)
+            echo "max_glibc=${MAX:-none}" | tee glibc-${{ matrix.target }}.txt
+          else
+            echo "max_glibc=missing" > glibc-${{ matrix.target }}.txt
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: build-log-${{ matrix.target }}
-          path: build-${{ matrix.target }}.log
+          path: |
+            build-${{ matrix.target }}.log
+            glibc-${{ matrix.target }}.txt
           if-no-files-found: warn
 
       - uses: actions/upload-artifact@v4
@@ -98,6 +108,9 @@ jobs:
               if [ -f "$d/codex-rec" ]; then
                 echo "artifact $n: size=$(stat -c%s "$d/codex-rec") sha256=$(sha256sum "$d/codex-rec" | cut -d" " -f1)"
               fi
+              for g in "$d"/glibc-*.txt; do
+                if [ -f "$g" ]; then echo "artifact $n: $(cat "$g")"; fi
+              done
               if [ -f "$d/build-x86_64-unknown-linux-musl.log" ]; then
                 echo "--- tail build-x86_64-unknown-linux-musl.log ---"
                 tail -n 40 "$d/build-x86_64-unknown-linux-musl.log"

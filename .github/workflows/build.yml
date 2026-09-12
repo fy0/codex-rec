@@ -24,9 +24,6 @@ jobs:
           - target: x86_64-unknown-linux-musl
             artifact: codex-rec-x86_64-unknown-linux-musl
             runner: ubuntu-24.04
-          - target: x86_64-unknown-linux-gnu
-            artifact: codex-rec-x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +81,7 @@ jobs:
 
   status:
     name: publish build status (no token needed)
-    needs: build
+    needs: [build, release]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -102,6 +99,7 @@ jobs:
             echo "ref=${{ github.ref }}"
             echo "date=$(date -u +%FT%TZ)"
             echo "build_result=${{ needs.build.result }}"
+            echo "release_result=${{ needs.release.result }}"
             for d in assets/*/; do
               [ -d "$d" ] || continue
               n=$(basename "$d")

@@ -664,8 +664,9 @@ static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new()
 fn build_client() -> reqwest::Client {
     // codex on Linux = reqwest + native-tls (bundled OpenSSL) with no ALPN and HTTP/1.1.
     // Mirror exactly that, so the upstream ClientHello matches codex's.
+    // NOTE: reqwest only configures ALPN on its rustls path; with native-tls it leaves ALPN
+    // unset, which is exactly why the real codex client sends no ALPN extension either.
     let tls = native_tls::TlsConnector::builder()
-        .request_alpns(&[] as &[&str])
         .build()
         .expect("failed to build native-tls connector");
     reqwest::Client::builder()

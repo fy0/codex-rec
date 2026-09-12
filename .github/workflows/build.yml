@@ -1,0 +1,90 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # aws-lc-sys ships pre-generated nasm objects; use them instead of requiring nasm on every runner.
+  AWS_LC_SYS_PREBUILT_NASM: "1"
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            artifact: codex-rec-x86_64-unknown-linux-musl
+          - target: x86_64-unknown-linux-gnu
+            artifact: codex-rec-x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install C toolchain for aws-lc-rs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake nasm musl-tools
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (release)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Inspect binary
+        run: |
+          BIN=target/${{ matrix.target }}/release/codex-rec
+          ls -la "$BIN"
+          file "$BIN" || true
+          ldd "$BIN" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release/codex-rec
+          if-no-files-found: error
+
+  release:
+    name: attach binaries to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+
+      - name: Flatten artifacts
+        run: |
+          set -eu
+          mkdir -p dist
+          for d in assets/*/; do
+            name=$(basename "$d")
+            cp "$d/codex-rec" "dist/$name"
+            chmod +x "dist/$name"
+          done
+          (cd dist && sha256sum ./* > SHA256SUMS.txt)
+          ls -la dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

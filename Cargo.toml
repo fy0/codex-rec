@@ -1,0 +1,24 @@
+[package]
+name = "codex-rec"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# TLS stack pinned to what the real codex client uses (rustls 0.23.36 + aws-lc-rs 1.16.2 +
+# prefer-post-quantum) so our ClientHello can match byte-for-byte. ALPN is cleared and HTTP/1.1
+# is forced, because the measured codex ClientHello carries no ALPN at all.
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
+rustls = { version = "0.23.36", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }
+rustls-native-certs = "0.8.3"
+aws-lc-rs = "1.16.2"
+bytes = "1"
+serde_json = "1"
+sha2 = "0.10"
+futures-util = "0.3"
+
+[profile.release]
+opt-level = 2
+strip = true

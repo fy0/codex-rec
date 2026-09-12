@@ -1,6 +1,6 @@
 [package]
 name = "codex-rec"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 description = "Recording + forwarding proxy for the Codex backend, with a configurable device persona"
@@ -23,9 +23,10 @@ rustls = { version = "0.23.36", default-features = false, features = ["aws_lc_rs
 rustls-native-certs = { version = "0.8.3", optional = true }
 aws-lc-rs = { version = "1.16.2", optional = true }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-bytes = "1"
 serde_json = "1"
+toml = "0.8"
+globset = "0.4"
+bytes = "1"
 sha2 = "0.10"
 futures-util = "0.3"
 

@@ -99,3 +99,27 @@ behind Cloudflare), or `x-openai-internal-codex-residency` (unless the account r
   `/etc/hosts` name (with SNI) and record the handshake.
 * HTTP: run `codex-rec` with `base_url = "http://127.0.0.1:18080/backend-api/codex"` in the codex
   provider config; every request/response is written to the log directory.
+
+## 6. What goes through the proxy — and what does not
+
+Everything that builds its URL from the provider's `base_url` is covered:
+
+* `POST {base_url}/responses` — the model turn (HTTP/SSE; WebSocket upgrades are **not** proxied yet,
+  so the client must run with `supports_websockets = false`)
+* `GET {base_url}/models?client_version=…` — the model catalog
+* `POST {base_url}/codex/analytics-events/events` — telemetry
+  (`codex-rs/analytics/src/client.rs` formats this from the same base URL)
+
+Not covered (these never use the provider URL):
+
+* **OAuth token refresh / auth** — a separate client against `auth.openai.com`
+  (`codex-rs/agent-identity/src/lib.rs`, login flow). It carries the refresh token, not the
+  account's model traffic.
+* **Plugin/app-store fetches** to `chatgpt.com/apps/...` and other web endpoints.
+* TUI links and the usage page (`CHATGPT_USAGE_URL = https://chatgpt.com/codex/settings/usage`,
+  `tui/src/status/card.rs`) are only displayed/opened in a browser — no request is made.
+
+Measured on a live box: with the client pointed at the recorder, the only outbound destinations
+observed were `chatgpt.com` (through the proxy) plus `ab.chatgpt.com` (Cloudflare). If you need a
+hard guarantee that nothing escapes, enforce it at the network layer (allow egress to the recorder
+only, plus whatever auth endpoint you choose to keep) rather than relying on the proxy alone.

@@ -18,9 +18,10 @@ upstream = "https://chatgpt.com"
 log_dir  = "/root/rec"
 
 # ---------------------------------------------------------------- device persona
-# Every field is "override or inherit":
-#   - omit the key, or write "inherit"  -> keep whatever the client sent
-#   - any other string                  -> replace that part of the identity
+# Each field has three states:
+#   - omitted      -> the built-in default (see the table below)
+#   - "inherit"    -> keep whatever the client sent
+#   - any value    -> use that value ("" removes a segment such as `terminal`)
 [persona]
 originator    = "codex-tui"        # `originator` header + User-Agent product name
 codex_version = "0.145.0"          # User-Agent version segments (+ ?client_version=)
@@ -31,8 +32,9 @@ user_agent    = "inherit"          # escape hatch: a literal User-Agent, wins ov
 rewrite_client_version = true      # also rewrite ?client_version= on /models
 
 # ---------------------------------------------------------------- header rewriting
+# `drop` entries are case-insensitive glob patterns (globset), so `cf-*` works.
 [headers.request]
-drop = ["cf-ray", "cf-connecting-ip", "cf-connecting-ipv6", "x-forwarded-for", "x-real-ip", "cdn-loop"]
+drop = ["cf-*", "x-forwarded-*", "x-real-ip", "cdn-loop"]
 set  = { }
 
 # [headers.request.set]
@@ -51,7 +53,49 @@ set  = { }
 #              mode does NOT look like codex; it is only for experiments. Requires a build with
 #              the `rustls-backend` feature (the Linux release and CI builds include it).
 extension_order = "fixed"
+
+# ---------------------------------------------------------------- sessions
+# With session_capture = true every codex session also gets its own interaction log:
+#   <session_dir>/ss-<date>-<session-uuid>-<title>.jsonl
+# One JSON object per line: requests (with the decoded body) and responses (with the answer text).
+session_capture = true
+session_dir     = "./sessions"
 ```
+
+## Persona field defaults
+
+An omitted field uses the built-in default; write `"inherit"` to keep the client's value instead.
+
+| field | omitted -> default | notes |
+|---|---|---|
+| `originator` | `codex-tui` | also the User-Agent product name |
+| `codex_version` | *inherit* | we never invent a version: the claimed version decides which model catalog the server returns |
+| `os` | `Linux` | the `<os>; <arch>` part of the User-Agent |
+| `arch` | `x86_64` | |
+| `terminal` | *(empty)* | no terminal segment |
+| `user_agent` | *composed* | set it to ship a literal User-Agent instead |
+
+Example — pin only the version, let everything else fall back to the defaults:
+
+```toml
+[persona]
+codex_version = "0.145.0"
+# -> user-agent: codex-tui/0.145.0 (Linux; x86_64) (codex-tui; 0.145.0)
+```
+
+## Swapping credentials
+
+`[headers.request].set` is applied after the client's headers are copied, so it can replace the
+bearer token and the account id — i.e. the proxy can run a client's traffic against a different
+account:
+
+```toml
+[headers.request]
+set = { authorization = "Bearer sk-...", "chatgpt-account-id" = "00000000-0000-0000-0000-000000000000" }
+```
+
+Keep such a config file at mode `0600`; the recorder itself never writes tokens to the log
+(`authorization`/`cookie`/`x-api-key` are redacted in every recorded header file).
 
 ## CLI flags
 

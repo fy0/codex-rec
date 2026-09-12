@@ -62,10 +62,12 @@ user-agent: codex-tui/0.145.0 (Debian 12.0.0; x86_64) xterm-256color (codex-tui;
 | | |
 |---|---|
 | recording | incoming/outgoing headers, raw + zstd-decoded bodies, streamed responses, per-request summaries (`model`, `service_tier`, reasoning effort, `client_metadata`), and the Cloudflare `__oailb` origin pool decoded from every response |
-| persona | per-field override-or-inherit, TOML-driven (originator, codex version, OS, arch, terminal, literal User-Agent) |
-| header rewriting | drop/set on both directions, from the config file or CLI flags |
+| persona | three-state fields per attribute: omitted = built-in default, `"inherit"` = the client's value, or an explicit value (originator, codex version, OS, arch, terminal, literal User-Agent) |
+| header rewriting | drop/set both directions, from the config file or CLI flags; `drop` patterns are globs (`cf-*`) |
 | body rewriting | remove/replace JSON keys (zstd is decoded and re-encoded automatically) |
 | catalog rewriting | `--rewrite-catalog` forces `use_responses_lite=false` and clears `service_tiers` in `/models` |
+| session capture | one interaction log per codex session: `sessions/ss-<date>-<uuid>-<title>.jsonl` (requests with decoded bodies, responses with the answer text) |
+| credential swapping | `[headers.request].set` can replace `authorization` / `chatgpt-account-id`, so a client's traffic can run against another account |
 | TLS modes | `fixed` (OpenSSL, codex-identical, default) or `randomize` (rustls backend, per-connection extension shuffling) |
 
 ## Build

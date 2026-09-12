@@ -21,6 +21,7 @@
 
 mod config;
 mod persona;
+mod session;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -44,6 +45,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use config::{Config, ExtensionOrder};
+use session::Sessions;
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 const MAX_ACC: usize = 32 * 1024 * 1024;
@@ -60,6 +62,7 @@ const HOP_BY_HOP: &[&str] = &[
 struct App {
     cfg: Config,
     client: reqwest::Client,
+    sessions: Option<Arc<Sessions>>,
 }
 
 // ---------------------------------------------------------------- helpers
@@ -73,6 +76,13 @@ fn stamp() -> String {
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("{n}-{seq}")
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn redact(name: &str, value: &str) -> String {
@@ -233,6 +243,8 @@ fn summarize_response(text: &str) -> Value {
     let mut answer = String::new();
     for line in text.lines() {
         let t = line.trim();
+        // HTTP/SSE responses prefix every JSON frame with `data: `; WebSocket frames do not.
+        let t = t.strip_prefix("data:").map(str::trim).unwrap_or(t);
         if !t.starts_with('{') {
             continue;
         }
@@ -304,6 +316,8 @@ struct Sink {
     status: u16,
     origin: Option<String>,
     persona: Vec<String>,
+    sessions: Option<Arc<Sessions>>,
+    session_id: Option<String>,
 }
 
 impl Sink {
@@ -336,6 +350,18 @@ impl Sink {
             "answer_chars": summary.get("answer_chars"),
         });
         let _ = append_line(&self.log_dir.join("index.jsonl"), &line.to_string());
+        if let (Some(sessions), Some(session)) = (self.sessions.as_ref(), self.session_id.as_deref()) {
+            sessions.append(
+                session,
+                &json!({
+                    "type": "response",
+                    "ts": now_ms(),
+                    "status": self.status,
+                    "origin": self.origin,
+                    "summary": summary,
+                }),
+            );
+        }
     }
 }
 
@@ -403,6 +429,13 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
         Err(e) => return text_response(400, &format!("body read error: {e}")),
     };
 
+    let session_id = parts
+        .headers
+        .get("session-id")
+        .or_else(|| parts.headers.get("thread-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
     // ---- incoming request capture + outgoing header assembly
     let mut incoming_lines: Vec<String> = Vec::new();
     let mut out_headers = reqwest::header::HeaderMap::new();
@@ -414,7 +447,12 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
         if name == "content-encoding" {
             cenc = Some(value.clone());
         }
-        if HOP_BY_HOP.contains(&name.as_str()) || cfg.request_rules.drop.contains(&name) {
+        let dropped = cfg
+            .request_drop_globs
+            .as_ref()
+            .map(|globs| globs.is_match(&name))
+            .unwrap_or(false);
+        if HOP_BY_HOP.contains(&name.as_str()) || dropped {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
@@ -498,6 +536,25 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                 "persona": persona_notes.clone(),
                 "request": summary,
             });
+            if let (Some(sessions), Some(session)) = (app.sessions.as_ref(), session_id.as_deref()) {
+                if let Some(text) = line
+                    .get("request")
+                    .and_then(|r| r.get("last_user"))
+                    .and_then(|v| v.as_str())
+                {
+                    sessions.note_title(session, text);
+                }
+                sessions.append(
+                    session,
+                    &json!({
+                        "type": "request",
+                        "ts": now_ms(),
+                        "uri": uri.clone(),
+                        "persona": persona_notes.clone(),
+                        "request": line.get("request"),
+                    }),
+                );
+            }
             let _ = append_line(&cfg.log_dir.join("index.jsonl"), &line.to_string());
         }
     }
@@ -524,8 +581,13 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
             let name = k.as_str().to_ascii_lowercase();
             let value = v.to_str().unwrap_or("<non-utf8>").to_owned();
             resp_lines.push(format!("{name}: {value}"));
+            let dropped = cfg
+                .response_drop_globs
+                .as_ref()
+                .map(|globs| globs.is_match(&name))
+                .unwrap_or(false);
             if HOP_BY_HOP.contains(&name.as_str())
-                || cfg.response_rules.drop.contains(&name)
+                || dropped
                 || name == "content-length"
                 || name == "transfer-encoding"
             {
@@ -594,6 +656,8 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
         status: status.as_u16(),
         origin,
         persona: persona_notes,
+        sessions: app.sessions.clone(),
+        session_id: session_id.clone(),
     }));
     let stream = TeeStream {
         inner: Box::pin(resp.bytes_stream()),
@@ -692,22 +756,27 @@ async fn main() {
     if let Some(p) = cfg.config_path.as_ref() {
         println!("config file: {}", p.display());
     }
-    println!(
-        "persona: originator={:?} codex_version={:?} os={:?} arch={:?} terminal={:?} user_agent={:?} rewrite_client_version={}",
-        cfg.persona.originator,
-        cfg.persona.codex_version,
-        cfg.persona.os,
-        cfg.persona.arch,
-        cfg.persona.terminal,
-        cfg.persona.user_agent,
-        cfg.persona.rewrite_client_version
-    );
+    match cfg.persona.as_ref() {
+        Some(p) => println!(
+            "persona: originator={:?} codex_version={:?} os={:?} arch={:?} terminal={:?} user_agent={:?} rewrite_client_version={}",
+            p.originator, p.codex_version, p.os, p.arch, p.terminal, p.user_agent, p.rewrite_client_version
+        ),
+        None => println!("persona: none (the client's identity passes through)"),
+    }
     for w in &warnings {
         eprintln!("warning: {w}");
     }
 
+    let sessions = cfg.session_capture.then(|| {
+        println!("session capture -> {}", cfg.session_dir.display());
+        Arc::new(Sessions::new(cfg.session_dir.clone()))
+    });
     let client = build_client(&cfg);
-    let app = Arc::new(App { cfg, client });
+    let app = Arc::new(App {
+        cfg,
+        client,
+        sessions,
+    });
     let listen = app.cfg.listen.clone();
     let router = Router::new().fallback(any(handle)).with_state(Arc::clone(&app));
     let listener = tokio::net::TcpListener::bind(&listen).await.expect("bind failed");

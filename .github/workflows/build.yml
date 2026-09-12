@@ -186,6 +186,12 @@ jobs:
               chmod +x "dist/$n${base#codex-rec}"
             done
           done
+          # Windows ships as a zip in the release (the bare .exe stays available as an Actions
+          # artifact for debugging).
+          if [ -f dist/codex-rec-x86_64-pc-windows-msvc.exe ]; then
+            (cd dist && zip -q codex-rec-x86_64-pc-windows-msvc.zip codex-rec-x86_64-pc-windows-msvc.exe \
+              && rm codex-rec-x86_64-pc-windows-msvc.exe)
+          fi
           (cd dist && sha256sum ./* > SHA256SUMS.txt)
           ls -la dist
 

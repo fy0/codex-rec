@@ -90,6 +90,12 @@ CI builds and attaches two artifacts per release:
   (TLS, HTTP headers, request bodies), measured; plus why a widely circulated fingerprint card is wrong.
 * [docs/config.md](docs/config.md) — full configuration reference.
 
+## v0.5.3
+
+* The IANA-zone test no longer hardcodes epochs: it derives its summer/winter instants from the
+  zone's own latest tzdata transition, so the crate's test suite keeps passing as the packaged
+  zoneinfo ages (that is what failed the v0.5.2 CI run — the parser itself was correct).
+
 ## v0.5.1
 
 * Fixed the TZif v2/v3 reader behind IANA zones in `[rewrite.environment].timezone`: the v2 block was

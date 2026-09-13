@@ -94,6 +94,32 @@ impl Zone {
         )
     }
 
+    /// The newest transition time in the zone's tzdata (used by tests to stay independent of the
+    /// wall clock: a packaged tzfile only knows the future up to its last transition).
+    pub fn last_transition(&self) -> Option<i64> {
+        let Zone::Named(name) = self else {
+            return None;
+        };
+        let dir = tzdata_dir()?;
+        let bytes = std::fs::read(dir.join(name)).ok()?;
+        let base = match bytes.get(4)? {
+            b'2' | b'3' => bytes[1..].windows(4).position(|w| w == b"TZif")? + 1,
+            _ => 0,
+        };
+        let (_, _, _, timecnt, _, _) = tzif_counts(&bytes, base)?;
+        if timecnt == 0 {
+            return None;
+        }
+        let wide = base != 0;
+        let size = if wide { 8 } else { 4 };
+        let at = base + 44 + (timecnt - 1) * size;
+        Some(if wide {
+            i64::from_be_bytes(bytes[at..at + 8].try_into().ok()?)
+        } else {
+            i32::from_be_bytes(bytes[at..at + 4].try_into().ok()?) as i64
+        })
+    }
+
     /// Local date as `YYYY-MM-DD`.
     pub fn date_at(&self, utc_secs: i64) -> String {
         let (y, m, d, _, _, _) = self.parts_at(utc_secs);
@@ -339,12 +365,23 @@ mod tests {
         // now must come out as exactly +08:00.
         let taipei = Zone::Named("Asia/Taipei".to_owned());
         assert_eq!(taipei.offset_at(1_789_254_600), 8 * 3600);
-        // a zone that observes DST must report the summer offset for a summer instant
+        // A zone that observes DST must report the summer offset in summer and the winter offset in
+        // winter. The timestamps have to be picked from the *zone's* latest transitions, otherwise a
+        // fixed epoch starts colliding with the packaged zoneinfo once the real clock moves on.
         let la = Zone::Named("America/Los_Angeles".to_owned());
-        let summer = 1_752_500_000i64; // 2025-07-15
-        let winter = 1_736_000_000i64; // 2024-12-31
-        assert_eq!(la.offset_at(summer), -7 * 3600, "summer should be PDT");
-        assert_eq!(la.offset_at(winter), -8 * 3600, "winter should be PST");
+        let latest = la.last_transition().expect("Los Angeles has transitions");
+        assert_eq!(
+            la.offset_at(latest + 86_400 * 30),
+            -7 * 3600,
+            "mid-summer should be PDT (after the {latest} transition)"
+        );
+        assert_eq!(
+            la.offset_at(latest - 86_400 * 365),
+            -8 * 3600,
+            "mid-winter should be PST (before the {latest} transition)"
+        );
+        // and an explicit, stable pair (verified against the packaged zoneinfo on 2026-09-13)
+        assert_eq!(la.offset_at(1_736_000_000), -8 * 3600, "2024-12-31 is PST");
     }
 
     #[test]

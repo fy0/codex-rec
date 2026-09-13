@@ -92,6 +92,25 @@ CI builds and attaches two artifacts per release:
 
 
 
+## v0.5.7
+
+* **Timezone handling, fixed and verified.** IANA names (`Asia/Taipei`, `America/Los_Angeles`) are now
+  resolved through the host's tzdata: the TZif v2/v3 reader was locating the 64-bit block with a
+  hand-computed header length and silently fell back to a fixed offset. It now finds the second `TZif`
+  magic, keeps the transition width from the version byte, and ships a synthetic-tzfile test that runs
+  with no tzdata installed. `Asia/Taipei` resolves as +08:00 (matches the system `date`) and
+  `America/Los_Angeles` gives -08:00 in winter / -07:00 in summer (matches zoneinfo).
+* **Debug hooks:** `CODEX_REC_TZ_DEBUG=1` logs the offset a zone resolved to, and
+  `CODEX_REC_NOW_TS=<epoch>` pins the instant used to derive `current_date` (both absent in normal
+  runs) — that is how a deployed binary's DST behaviour is verified against the system clock.
+* **`[rewrite.environment]`** — edit the `<environment_context>` block the client sends: `timezone`
+  (offset or IANA name, DST via the system tzdata), `current_date` (`auto` converts the UTC stamp into
+  the configured zone, `shift±Nd`, or a literal date), `cwd`, `shell`, `workspace_roots`, `drop`, and
+  `fill_missing`. Absent keys change nothing; every edit is logged, stored as `env_rewrite` in
+  `index.jsonl`, and the rewritten body is saved as `.req.out.json`.
+* **`docs/configuration-guide.md`** — annotated guide to every key, including the full list of
+  terminal values `codex-rs/terminal-detection` can produce and what the persona does with them.
+
 ## v0.5.0
 
 * **`[rewrite.environment]`** — edit the `<environment_context>` block the client sends: `timezone`

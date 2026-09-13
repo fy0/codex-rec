@@ -65,9 +65,22 @@ impl Zone {
         match self {
             Zone::Offset(seconds) => *seconds,
             Zone::Named(name) => {
+                // Windows has no zoneinfo files: ask the OS (DST aware) for known zone names.
+                if let Some(id) = iana_to_windows_tz(name) {
+                    if let Some(seconds) = windows_offset_at(id, utc_secs) {
+                        if std::env::var_os("CODEX_REC_TZ_DEBUG").is_some() {
+                            eprintln!(
+                                "[timezone] {name} -> {:+03}:{:02} (windows api, id {id})",
+                                seconds / 3600,
+                                (seconds.abs() % 3600) / 60
+                            );
+                        }
+                        return seconds;
+                    }
+                }
                 if let Some(seconds) = tzfile_offset(name, utc_secs) {
                     if std::env::var_os("CODEX_REC_TZ_DEBUG").is_some() {
-                        eprintln!("[timezone] {name} -> {:+03}:{:02} (tzdata)", seconds / 3600, (seconds.abs() % 3600) / 60);
+                        eprintln!("[timezone] {name} -> {:+03}:{:02} (tzdata file)", seconds / 3600, (seconds.abs() % 3600) / 60);
                     }
                     return seconds;
                 }
@@ -322,6 +335,65 @@ fn windows_tz_to_iana(id: &str) -> Option<&'static str> {
     })
 }
 
+/// Windows timezone ids that correspond to the IANA names we accept, so an offset query can be made
+/// through the OS instead of through tzdata (Windows ships no zoneinfo files). Mirrors
+/// `windows_tz_to_iana` in the other direction.
+fn iana_to_windows_tz(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "Etc/UTC" | "UTC" | "GMT" => "UTC",
+        "America/Los_Angeles" => "Pacific Standard Time",
+        "America/Denver" => "Mountain Standard Time",
+        "America/Phoenix" => "US Mountain Standard Time",
+        "America/Chicago" => "Central Standard Time",
+        "America/New_York" => "Eastern Standard Time",
+        "America/Halifax" => "Atlantic Standard Time",
+        "America/Sao_Paulo" => "E. South America Standard Time",
+        "Europe/London" => "GMT Standard Time",
+        "Europe/Berlin" => "W. Europe Standard Time",
+        "Europe/Budapest" => "Central Europe Standard Time",
+        "Europe/Warsaw" => "Central European Standard Time",
+        "Europe/Paris" => "Romance Standard Time",
+        "Europe/Chisinau" => "E. Europe Standard Time",
+        "Europe/Moscow" => "Russian Standard Time",
+        "Europe/Istanbul" => "Turkey Standard Time",
+        "Asia/Jerusalem" => "Israel Standard Time",
+        "Asia/Riyadh" => "Arab Standard Time",
+        "Asia/Kolkata" => "India Standard Time",
+        "Asia/Dhaka" => "Bangladesh Standard Time",
+        "Asia/Bangkok" => "SE Asia Standard Time",
+        "Asia/Shanghai" => "China Standard Time",
+        "Asia/Taipei" => "Taipei Standard Time",
+        "Asia/Singapore" => "Singapore Standard Time",
+        "Asia/Tokyo" => "Tokyo Standard Time",
+        "Asia/Seoul" => "Korea Standard Time",
+        "Australia/Perth" => "W. Australia Standard Time",
+        "Australia/Sydney" => "AUS Eastern Standard Time",
+        "Pacific/Auckland" => "New Zealand Standard Time",
+        _ => return None,
+    })
+}
+
+/// Asks the OS for the offset of a Windows timezone id at a given instant (DST aware).
+#[cfg(windows)]
+fn windows_offset_at(id: &str, utc_secs: i64) -> Option<i32> {
+    let script = format!(
+        "$id='{id}'; $z=[System.TimeZoneInfo]::FindSystemTimeZoneById($id);          $t=[DateTimeOffset]::FromUnixTimeSeconds({utc_secs}).UtcDateTime;          Write-Output ([int]($z.GetUtcOffset($t).TotalSeconds))"
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse::<i32>().ok()
+}
+
+#[cfg(not(windows))]
+fn windows_offset_at(_id: &str, _utc_secs: i64) -> Option<i32> {
+    None
+}
+
 /// Reads the Windows timezone (id + current base offset) by asking PowerShell.
 #[cfg(windows)]
 fn windows_zone() -> Option<Zone> {
@@ -432,6 +504,23 @@ mod tests {
         assert_eq!(windows_tz_to_iana("Pacific Standard Time"), Some("America/Los_Angeles"));
         assert_eq!(windows_tz_to_iana("UTC"), Some("Etc/UTC"));
         assert_eq!(windows_tz_to_iana("Nowhere Standard Time"), None);
+    }
+
+    #[test]
+    fn iana_names_map_back_to_windows_ids() {
+        assert_eq!(iana_to_windows_tz("Asia/Shanghai"), Some("China Standard Time"));
+        assert_eq!(iana_to_windows_tz("America/Los_Angeles"), Some("Pacific Standard Time"));
+        assert_eq!(iana_to_windows_tz("Etc/UTC"), Some("UTC"));
+        assert_eq!(iana_to_windows_tz("Mars/Phobos"), None);
+        // and the two tables agree on the ids they share
+        for (id, iana) in [
+            ("China Standard Time", "Asia/Shanghai"),
+            ("Pacific Standard Time", "America/Los_Angeles"),
+            ("Taipei Standard Time", "Asia/Taipei"),
+        ] {
+            assert_eq!(windows_tz_to_iana(id), Some(iana));
+            assert_eq!(iana_to_windows_tz(iana), Some(id));
+        }
     }
 
     #[test]

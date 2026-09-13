@@ -92,6 +92,15 @@ CI builds and attaches two artifacts per release:
 
 
 
+## v0.6.0
+
+* **IANA timezones work on Windows.** A Windows host has no `/usr/share/zoneinfo`, so
+  `America/Los_Angeles` (and every other IANA name) used to fall back to a fixed offset. The rewriter
+  and the probe now ask the OS (`[System.TimeZoneInfo]::GetUtcOffset`) for the offset **at the
+  requested instant**, so DST is applied: `America/Los_Angeles` resolves to `-07:00` in September and
+  `-08:00` in winter, matching the platform. `CODEX_REC_TZ_DEBUG=1` prints which path was used
+  (`windows api`, `tzdata file`, or the fixed-offset fallback).
+
 ## v0.5.7
 
 * **Timezone handling, fixed and verified.** IANA names (`Asia/Taipei`, `America/Los_Angeles`) are now

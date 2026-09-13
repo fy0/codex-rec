@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "codex-rec"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "aws-lc-rs",
  "axum",

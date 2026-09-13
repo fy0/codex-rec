@@ -92,6 +92,14 @@ CI builds and attaches two artifacts per release:
 
 
 
+## v0.6.3
+
+* **Fixed: the environment rewrite only looked at the first text part of a message.** The real client
+  puts several parts into one user message (AGENTS.md instructions, skills, then the environment
+  block), so the rewrite examined a part without the marker, found nothing, and silently left the
+  client's own timezone in place — while synthetic single-part tests passed. Every text part is now
+  rewritten, with a regression test built from the real message shape.
+
 ## v0.6.2
 
 * **zstd decompression is now in-process** (`ruzstd`, pure Rust) instead of shelling out to a `zstd`

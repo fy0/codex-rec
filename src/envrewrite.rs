@@ -95,15 +95,10 @@ pub fn apply_env(section: &EnvironmentSection, body: &mut Value, now: Option<i64
         return notes;
     };
     for item in items.iter_mut() {
-        if let Some(text) = item_text_mut(item) {
-            if !text.contains("<environment_context>") {
-                continue;
-            }
-            if let Some(updated) = rewrite_block(section, text, &mut zone, now, &mut notes) {
-                *text = updated;
-                notes.items_touched += 1;
-                notes.changed = true;
-            }
+        let touched = rewrite_item_parts(section, item, &mut zone, now, &mut notes);
+        if touched > 0 {
+            notes.items_touched += 1;
+            notes.changed = true;
         }
     }
     if notes.items_touched > 0 {
@@ -118,18 +113,38 @@ fn zone_name(raw: &str) -> String {
     raw.trim().to_owned()
 }
 
-/// Finds the mutable text of a `message`-style input item.
-fn item_text_mut(item: &mut Value) -> Option<&mut String> {
-    let parts = item.get_mut("content")?.as_array_mut()?;
+/// Rewrites every text part of `item` that carries an `<environment_context>` block.
+///
+/// A message item usually has **several** text parts (codex puts AGENTS.md instructions, skills and
+/// the environment block into one user message), so this must not stop at the first part — that bug
+/// made the rewrite silently skip real client requests while synthetic single-part tests passed.
+fn rewrite_item_parts(
+    section: &EnvironmentSection,
+    item: &mut Value,
+    zone: &mut Option<Zone>,
+    now: Option<i64>,
+    notes: &mut Notes,
+) -> usize {
+    let Some(parts) = item.get_mut("content").and_then(|v| v.as_array_mut()) else {
+        return 0;
+    };
+    let mut touched_parts = 0;
     for part in parts.iter_mut() {
-        let is_text = matches!(part.get("text"), Some(Value::String(_)));
-        if is_text {
-            if let Some(Value::String(text)) = part.get_mut("text") {
-                return Some(text);
+        // Copy the text out, rewrite it, then write it back: keeps the borrow local and simple.
+        let Some(text) = part.get("text").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        if !text.contains("<environment_context>") {
+            continue;
+        }
+        if let Some(updated) = rewrite_block(section, &text, zone, now, notes) {
+            if let Some(slot) = part.get_mut("text") {
+                *slot = Value::String(updated);
             }
+            touched_parts += 1;
         }
     }
-    None
+    touched_parts
 }
 
 fn rewrite_block(
@@ -461,6 +476,34 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("<timezone>+09:00</timezone>"));
+    }
+
+    /// The real client sends one user message whose content holds several parts, with the
+    /// environment block **not** first (AGENTS.md, skills, … come before it). The rewrite must look
+    /// at every part — stopping at the first one silently skipped real requests.
+    #[test]
+    fn rewrites_the_block_when_it_is_not_the_first_content_part() {
+        let section: EnvironmentSection =
+            toml::from_str("timezone = \"+08:00\"
+current_date = \"auto\"").unwrap();
+        let mut b = json!({
+            "input": [{
+                "type": "message", "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "# AGENTS.md instructions (no block here)"},
+                    {"type": "input_text", "text": BLOCK},
+                    {"type": "input_text", "text": "hi, show me the environment block"},
+                ]
+            }]
+        });
+        let notes = apply_env(&section, &mut b, Some(NOW));
+        assert!(notes.changed);
+        let parts = b["input"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], "# AGENTS.md instructions (no block here)");
+        assert_eq!(parts[2]["text"], "hi, show me the environment block");
+        let rewritten = parts[1]["text"].as_str().unwrap();
+        assert!(rewritten.contains("<timezone>+08:00</timezone>"), "{rewritten}");
+        assert!(rewritten.contains("<current_date>2026-09-13</current_date>"), "{rewritten}");
     }
 
     #[test]

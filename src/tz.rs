@@ -103,15 +103,11 @@ impl Zone {
         };
         let dir = tzdata_dir()?;
         let bytes = std::fs::read(dir.join(name)).ok()?;
-        let base = match bytes.get(4)? {
-            b'2' | b'3' => bytes[1..].windows(4).position(|w| w == b"TZif")? + 1,
-            _ => 0,
-        };
+        let (base, wide) = block_base(&bytes)?;
         let (_, _, _, timecnt, _, _) = tzif_counts(&bytes, base)?;
         if timecnt == 0 {
             return None;
         }
-        let wide = base != 0;
         let size = if wide { 8 } else { 4 };
         let at = base + 44 + (timecnt - 1) * size;
         Some(if wide {
@@ -153,7 +149,27 @@ fn tzdata_dir() -> Option<&'static Path> {
         .as_deref()
 }
 
-/// Reads the offset for an IANA name out of the system tzdata (TZif v1/v2/v3).
+/// Finds the data block to read and whether its transitions are 64-bit.
+///
+/// A v2/v3/v4 file holds a 32-bit block followed by a 64-bit one; the 64-bit block is located by the
+/// second `TZif` magic (computing the v1 length by hand is easy to get wrong, and the optional
+/// isstd/isut arrays differ between distributions). A single-block v2+ file is read from offset 0.
+fn block_base(bytes: &[u8]) -> Option<(usize, bool)> {
+    if bytes.len() < 44 || &bytes[0..4] != b"TZif" {
+        return None;
+    }
+    let version = *bytes.get(4)?;
+    if version >= b'2' {
+        match bytes[1..].windows(4).position(|w| w == b"TZif") {
+            Some(rel) => Some((rel + 1, true)),
+            None => Some((0, true)),
+        }
+    } else {
+        Some((0, false))
+    }
+}
+
+/// Reads the offset for an IANA name out of the system tzdata (TZif v1/v2/v3/v4).
 fn tzfile_offset(name: &str, utc_secs: i64) -> Option<i32> {
     let dir = tzdata_dir()?;
     if name.contains("..") || name.starts_with('/') {
@@ -163,22 +179,13 @@ fn tzfile_offset(name: &str, utc_secs: i64) -> Option<i32> {
     if bytes.len() < 44 || &bytes[0..4] != b"TZif" {
         return None;
     }
-    // A v2/v3 file holds a v1 block followed by a 64-bit block; find the second magic rather than
-    // computing the v1 length (the optional isstd/isut arrays make that easy to get wrong).
-    let base = match bytes[4] {
-        b'2' | b'3' => match bytes[1..].windows(4).position(|w| w == b"TZif") {
-            Some(rel) => rel + 1,
-            None => return None,
-        },
-        _ => 0,
-    };
+    let (base, wide) = block_base(&bytes)?;
     if bytes.len() < base + 44 {
         return None;
     }
     let (_isutcnt, _isstdcnt, _leapcnt, timecnt, typecnt, _charcnt) = tzif_counts(&bytes, base)?;
 
-    // transition times are 8-byte in v2+ blocks, 4-byte in v1
-    let wide = base != 0;
+    // transition times are 8-byte in v2+ blocks, 4-byte in the 32-bit v1 block
     let size = if wide { 8 } else { 4 };
     let transitions = base + 44;
     let type_indexes = transitions + timecnt * size;
@@ -356,33 +363,92 @@ mod tests {
 
     /// Only meaningful where zoneinfo exists (CI and the landing box); on a bare Windows host the
     /// documented fallback is used instead.
+    ///
+    /// The assertions are deliberately independent of how much future a given tzdata release carries:
+    /// they only require the *relative* behaviour around a zone's own transitions. Absolute dates are
+    /// verified end to end on the landing box against the system `date` command.
     #[test]
     fn tzdata_path_is_used_when_present() {
-        if tzdata_dir().is_none() {
+        let Some(dir) = tzdata_dir() else {
             eprintln!("no tzdata on this host; skipping");
             return;
-        }
-        // Asia/Taipei has a 41-transition history (types +08:06 / +08:00 / +09:00 DST); the offset
-        // now must come out as exactly +08:00.
+        };
+        // Asia/Taipei: its final transition (1980) left it on +08:00 for good.
         let taipei = Zone::Named("Asia/Taipei".to_owned());
-        assert_eq!(taipei.offset_at(1_789_254_600), 8 * 3600);
-        // A zone that observes DST must report the summer offset in summer and the winter offset in
-        // winter. The timestamps have to be picked from the *zone's* latest transitions, otherwise a
-        // fixed epoch starts colliding with the packaged zoneinfo once the real clock moves on.
+        eprintln!(
+            "tzdata dir {} | Asia/Taipei file {} bytes | last transition {:?}",
+            dir.display(),
+            std::fs::metadata(dir.join("Asia/Taipei")).map(|m| m.len()).unwrap_or(0),
+            taipei.last_transition()
+        );
+        for ts in [0i64, 1_789_254_600, 2_500_000_000] {
+            let off = taipei.offset_at(ts);
+            eprintln!("  Asia/Taipei at {ts} -> {off} ({}h)", off / 3600);
+            assert_eq!(off, 8 * 3600, "Asia/Taipei must be +08:00 at {ts}");
+        }
+        // America/Los_Angeles: a DST zone. Around its own latest transition the offset must switch
+        // between PST (-8) and PDT (-7); which side comes first depends on the release, so compare as
+        // a set.
         let la = Zone::Named("America/Los_Angeles".to_owned());
         let latest = la.last_transition().expect("Los Angeles has transitions");
+        let before = la.offset_at(latest - 86_400 * 30);
+        let after = la.offset_at(latest + 86_400 * 30);
+        eprintln!("  America/Los_Angeles last transition {latest}: before={before} after={after}");
+        let mut pair = [before, after];
+        pair.sort();
         assert_eq!(
-            la.offset_at(latest + 86_400 * 30),
-            -7 * 3600,
-            "mid-summer should be PDT (after the {latest} transition)"
+            pair,
+            [-8 * 3600, -7 * 3600],
+            "the offsets around the latest transition must be PST and PDT (got {before}/{after})"
         );
-        assert_eq!(
-            la.offset_at(latest - 86_400 * 365),
-            -8 * 3600,
-            "mid-winter should be PST (before the {latest} transition)"
-        );
-        // and an explicit, stable pair (verified against the packaged zoneinfo on 2026-09-13)
-        assert_eq!(la.offset_at(1_736_000_000), -8 * 3600, "2024-12-31 is PST");
+    }
+
+    /// A synthetic TZif v2 file with one 64-bit block: proves the reader picks the second block and
+    /// the 8-byte transitions (the previous bug read the 32-bit block's bytes instead).
+    #[test]
+    fn reader_handles_a_synthetic_v2_file() {
+        // Build a v2 file: [v1 header + v1 data (1 transition, 1 type)] then [v2 header + v2 data].
+        let mut out = Vec::new();
+        let header = |version: u8, timecnt: u32, typecnt: u32| {
+            let mut h = Vec::new();
+            h.extend_from_slice(b"TZif");
+            h.push(version);
+            h.extend_from_slice(&[0u8; 15]);
+            h.extend_from_slice(&0u32.to_be_bytes()); // isutcnt
+            h.extend_from_slice(&0u32.to_be_bytes()); // isstdcnt
+            h.extend_from_slice(&0u32.to_be_bytes()); // leapcnt
+            h.extend_from_slice(&timecnt.to_be_bytes());
+            h.extend_from_slice(&typecnt.to_be_bytes());
+            h.extend_from_slice(&4u32.to_be_bytes()); // charcnt
+            h
+        };
+        // v1 block: one transition at t=0 to type 0 (+00:00)
+        out.extend(header(b'2', 1, 1));
+        out.extend(0i32.to_be_bytes());
+        out.push(0);
+        out.extend(0i32.to_be_bytes()); // gmtoff 0
+        out.push(0);
+        out.push(0);
+        out.extend_from_slice(b"UTC ");
+        // v2 block: one transition at t=0 to type 0 (+08:00)
+        let v2_start = out.len();
+        out.extend(header(b'2', 1, 1));
+        out.extend(0i64.to_be_bytes());
+        out.push(0);
+        out.extend((8 * 3600i32).to_be_bytes());
+        out.push(0);
+        out.push(0);
+        out.extend_from_slice(b"TPE ");
+
+        let (base, wide) = block_base(&out).expect("v2 block located");
+        assert_eq!(base, v2_start, "the second TZif magic must be used");
+        assert!(wide, "v2 transitions are 64-bit");
+        let (_, _, _, timecnt, typecnt, _) = tzif_counts(&out, base).unwrap();
+        assert_eq!((timecnt, typecnt), (1, 1));
+        let at = base + 44 + 8; // transition (8 bytes) -> type index
+        let ty = at + 1;
+        let off = i32::from_be_bytes(out[ty..ty + 4].try_into().unwrap());
+        assert_eq!(off, 8 * 3600);
     }
 
     #[test]

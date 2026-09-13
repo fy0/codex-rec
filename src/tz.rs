@@ -96,6 +96,7 @@ impl Zone {
 
     /// The newest transition time in the zone's tzdata (used by tests to stay independent of the
     /// wall clock: a packaged tzfile only knows the future up to its last transition).
+    #[cfg(test)]
     pub fn last_transition(&self) -> Option<i64> {
         let Zone::Named(name) = self else {
             return None;

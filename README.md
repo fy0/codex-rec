@@ -92,6 +92,17 @@ CI builds and attaches two artifacts per release:
 
 
 
+## v0.6.2
+
+* **zstd decompression is now in-process** (`ruzstd`, pure Rust) instead of shelling out to a `zstd`
+  binary. Rust's standard library has no compression at all, and relying on a CLI meant the
+  environment rewrite silently skipped every compressed request on a Windows host whose `zstd` lived
+  outside `PATH`. The CLI survives only as a fallback (the pure-Rust ecosystem decodes but does not
+  compress) and for re-compressing a rewritten body. A real zstd frame is embedded in the test suite,
+  so the decoder is covered without any external binary. No C toolchain is needed on Windows.
+* This build is produced **locally** (`cargo build --release`) while the release 0.6.x line is being
+  sorted out — see the repository tags.
+
 ## v0.6.1
 
 * **Finding `zstd` no longer depends on `PATH`.** Decoding a compressed request body shells out to

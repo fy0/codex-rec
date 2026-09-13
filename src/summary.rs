@@ -31,71 +31,120 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Finds the `zstd` CLI: `$ZSTD` first, then a copy next to our own executable, then `PATH`.
+/// zstd support.
 ///
-/// The CLI is only needed to decode/encode compressed request bodies; on Windows it is frequently
-/// installed somewhere that is not on `PATH` (e.g. a conda environment), which used to make the
-/// environment rewrite silently skip compressed requests.
-fn zstd_program() -> std::ffi::OsString {
-    if let Some(path) = std::env::var_os("ZSTD") {
-        if std::path::Path::new(&path).is_file() {
-            return path;
+/// Rust's standard library has no compression at all (no `zstd`, no `flate`), so this cannot be a
+/// std call. Two implementations are used instead:
+///   * **in-process, pure Rust** (`ruzstd`) — always available, cross-compiles to musl/Windows with
+///     no C toolchain, and is what a release build actually uses;
+///   * the `zstd` **CLI** as a fallback, for the rare case the in-process decoder rejects a frame
+///     (it accepts anything libzstd produces).
+///
+/// The request bodies we must decode are exactly what codex itself produced with the `zstd` crate,
+/// so the pure-Rust path covers the normal case.
+mod zstd_support {
+    use std::io::{Read, Write};
+
+    /// Decodes a zstd frame. `None` means "could not decode" (the caller then skips the rewrite).
+    pub fn decode(raw: &[u8]) -> Option<Vec<u8>> {
+        if raw.is_empty() {
+            return Some(Vec::new());
+        }
+        match decode_in_process(raw) {
+            Some(out) => Some(out),
+            None => decode_with_cli(raw),
         }
     }
-    let exe = if cfg!(windows) { "zstd.exe" } else { "zstd" };
-    if let Ok(own) = std::env::current_exe() {
-        if let Some(dir) = own.parent() {
-            let candidate = dir.join(exe);
+
+    fn decode_in_process(raw: &[u8]) -> Option<Vec<u8>> {
+        let mut cursor = std::io::Cursor::new(raw);
+        let mut decoder = ruzstd::StreamingDecoder::new(&mut cursor).ok()?;
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).ok()?;
+        // an empty decode of a non-empty frame means we did not understand it
+        if out.is_empty() && !raw.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// Encodes with the CLI only; pure-Rust zstd compression is not part of `ruzstd`.
+    pub fn encode(input: &[u8]) -> Option<Vec<u8>> {
+        let mut child = std::process::Command::new(cli_program())
+            .args(["-3", "-q", "-c"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let data = input.to_vec();
+        let feeder = std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+            drop(stdin);
+        });
+        let out = child.wait_with_output().ok()?;
+        let _ = feeder.join();
+        out.status.success().then_some(out.stdout)
+    }
+
+    fn decode_with_cli(raw: &[u8]) -> Option<Vec<u8>> {
+        let mut child = std::process::Command::new(cli_program())
+            .args(["-d", "-q", "-c"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let data = raw.to_vec();
+        let feeder = std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+            drop(stdin);
+        });
+        let out = child.wait_with_output().ok()?;
+        let _ = feeder.join();
+        out.status.success().then_some(out.stdout)
+    }
+
+    /// `$ZSTD`, then next to our own executable, then a few well-known locations, then `PATH`.
+    fn cli_program() -> std::ffi::OsString {
+        if let Some(path) = std::env::var_os("ZSTD") {
+            if std::path::Path::new(&path).is_file() {
+                return path;
+            }
+        }
+        let exe = if cfg!(windows) { "zstd.exe" } else { "zstd" };
+        if let Ok(own) = std::env::current_exe() {
+            if let Some(dir) = own.parent() {
+                let candidate = dir.join(exe);
+                if candidate.is_file() {
+                    return candidate.into_os_string();
+                }
+            }
+        }
+        for dir in [
+            "C:/ProgramData/miniconda3/Library/bin",
+            "C:/ProgramData/miniconda3/Scripts",
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+        ] {
+            let candidate = std::path::Path::new(dir).join(exe);
             if candidate.is_file() {
                 return candidate.into_os_string();
             }
         }
+        std::ffi::OsString::from(exe)
     }
-    for dir in [
-        "C:/ProgramData/miniconda3/Library/bin",
-        "C:/ProgramData/miniconda3/Scripts",
-        "/usr/local/bin",
-        "/opt/homebrew/bin",
-    ] {
-        let candidate = std::path::Path::new(dir).join(exe);
-        if candidate.is_file() {
-            return candidate.into_os_string();
-        }
-    }
-    std::ffi::OsString::from(exe)
 }
 
-/// Runs the system `zstd` CLI (`mode` is `-d` or `-3`).
-pub fn zstd_cli(mode: &str, input: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Write;
-    let mut child = std::process::Command::new(zstd_program())
-        .arg(mode)
-        .arg("-q")
-        .arg("-c")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
-    let data = input.to_vec();
-    let feeder = std::thread::spawn(move || {
-        let _ = stdin.write_all(&data);
-        drop(stdin);
-    });
-    let out = child.wait_with_output().ok()?;
-    let _ = feeder.join();
-    if out.status.success() {
-        Some(out.stdout)
-    } else {
-        None
-    }
-}
+pub use zstd_support::{decode as zstd_decode, encode as zstd_encode};
 
 /// Decompresses a body according to its `content-encoding` (only zstd is handled).
 pub fn decode_body(raw: &[u8], cenc: Option<&str>) -> Option<Vec<u8>> {
     match cenc {
-        Some(e) if e.to_ascii_lowercase().contains("zstd") => zstd_cli("-d", raw),
+        Some(e) if e.to_ascii_lowercase().contains("zstd") => zstd_decode(raw),
         _ => Some(raw.to_vec()),
     }
 }
@@ -355,7 +404,7 @@ impl Summarizer {
         if serde_json::from_slice::<Value>(&raw).is_err() && !raw.is_empty() {
             if let Some(e) = self.response_encoding.as_deref() {
                 if e.to_ascii_lowercase().contains("zstd") {
-                    if let Some(plain) = zstd_cli("-d", &raw) {
+                    if let Some(plain) = zstd_decode(&raw) {
                         raw = plain;
                         decoded_from_zstd = true;
                     }
@@ -400,6 +449,27 @@ impl Summarizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real zstd frame produced by `zstd -3` (145/139 bytes) — proves the **in-process** decoder
+    /// works without a `zstd` binary anywhere on the machine, which is what broke the rewrite on a
+    /// Windows host whose zstd lived outside `PATH`.
+    const ZSTD_FRAME_HEX: &str = "28b52ffd0458f5030002481a1c6089754000f50baf51667de59305820b388965292c5e1603c082380151122591152b140b0c086a59017285893fb7cc300a641f65f54fa174073df372f23e5f45bf0a1727cb4fc7cb6fa074f29936e79f971f116ba8b0bc4e54e7e42677b603706c64bcdcdc009fa1060059d1514d1daf6a5545e2ab6b1dee505134101b36";
+
+    #[test]
+    fn zstd_decodes_in_process_without_the_cli() {
+        let raw: Vec<u8> = (0..ZSTD_FRAME_HEX.len() / 2)
+            .map(|i| u8::from_str_radix(&ZSTD_FRAME_HEX[i * 2..i * 2 + 2], 16).unwrap())
+            .collect();
+        let plain = decode_body(&raw, Some("zstd")).expect("in-process decode");
+        let text = String::from_utf8_lossy(&plain);
+        assert!(text.contains("\"model\":\"gpt-6-astra\""), "{text}");
+        assert!(text.contains("<timezone>Etc/UTC</timezone>"), "{text}");
+        // a zstd frame that is not one must not panic, just report "cannot decode"
+        assert!(decode_body(b"not a zstd frame", Some("zstd")).is_none());
+        // content-encodings we do not handle pass through untouched
+        assert_eq!(decode_body(b"plain", None).unwrap(), b"plain");
+        assert_eq!(decode_body(b"plain", Some("identity")).unwrap(), b"plain");
+    }
 
     fn feed(s: &mut Summarizer, frames: &[&str]) {
         for frame in frames {

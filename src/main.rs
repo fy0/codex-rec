@@ -502,7 +502,7 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                     }
                     let new = serde_json::to_vec(&v).unwrap_or_default();
                     body_out = if cenc.is_some() {
-                        summary::zstd_cli("-3", &new).unwrap_or(new)
+                        summary::zstd_encode(&new).unwrap_or(new)
                     } else {
                         new
                     };

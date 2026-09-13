@@ -7,7 +7,7 @@
 //!                         260912-231425-user-r0001.req.out.hdr
 //!                         260912-231425-user-r0001.req.body      (raw, only when compressed)
 //!                         260912-231425-user-r0001.req.json      (decoded)
-//!                         260912-231425-user-r0001.req.out.json  (only when rewritten)
+//!                         260912-231425-user-r0001.req.out.json  (rewritten body, decoded)
 //!                         260912-231425-user-r0001.req.summary.json
 //!                         260912-231425-user-r0001.resp.hdr
 //!                         260912-231425-user-r0001.resp.stream.sse

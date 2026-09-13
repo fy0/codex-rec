@@ -1,6 +1,6 @@
 [package]
 name = "codex-rec"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 publish = false
 description = "Recording + forwarding proxy for the Codex backend, with a configurable device persona"
@@ -29,6 +29,9 @@ globset = "0.4"
 bytes = "1"
 sha2 = "0.10"
 os_info = "3.12"
+# Same crate codex itself uses (libzstd via zstd-sys) for request-body compression.
+# Pure Rust so it cross-compiles for the musl/windows release builds without extra toolchain work.
+ruzstd = "0.7"
 futures-util = "0.3"
 
 # The Linux codex client bundles a static OpenSSL 3.5-class build; build our own so the

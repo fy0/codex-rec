@@ -240,7 +240,9 @@ fill_missing  = false           # create elements the client did not send (defau
 ```
 
 * `timezone` accepts both forms a real client sends: a UTC offset (`+08:00`, `-05:30`, `UTC`) or an
-  IANA name (`Asia/Taipei`, `Europe/Berlin`, `America/Los_Angeles`). IANA names are resolved through
+  IANA name (`Asia/Taipei`, `Europe/Berlin`, `America/Los_Angeles`). On Windows the probe and the
+  rewriter read the real system zone (`Get-TimeZone`, e.g. `China Standard Time`) and map it to its
+  IANA equivalent, so a Windows host reports `Asia/Shanghai` rather than a bare offset. IANA names are resolved through
   the host's tzdata (`/usr/share/zoneinfo`, …) so **DST is applied**; if tzdata is missing the
   recorder falls back to a fixed offset and says so in the log (`[timezone] no tzdata entry usable
   for …`). v0.5.1 fixed the TZif v2/v3 parser, which previously always took that fallback.

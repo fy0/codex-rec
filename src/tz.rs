@@ -284,8 +284,78 @@ pub fn from_env() -> Option<Zone> {
 }
 
 #[allow(dead_code)] // available for a future `timezone = "env:TZ"` form
+/// Maps a Windows timezone id (`tzutil` / `Get-TimeZone`) to an IANA name, so a Windows host keeps
+/// its DST rules instead of collapsing to a fixed offset. Only the common ids are listed; anything
+/// unknown falls back to the machine's current base offset.
+fn windows_tz_to_iana(id: &str) -> Option<&'static str> {
+    Some(match id.trim() {
+        "UTC" | "Dateline Standard Time" => "Etc/UTC",
+        "Pacific Standard Time" => "America/Los_Angeles",
+        "Mountain Standard Time" => "America/Denver",
+        "US Mountain Standard Time" => "America/Phoenix",
+        "Central Standard Time" => "America/Chicago",
+        "Eastern Standard Time" => "America/New_York",
+        "Atlantic Standard Time" => "America/Halifax",
+        "E. South America Standard Time" => "America/Sao_Paulo",
+        "GMT Standard Time" => "Europe/London",
+        "W. Europe Standard Time" => "Europe/Berlin",
+        "Central Europe Standard Time" => "Europe/Budapest",
+        "Central European Standard Time" => "Europe/Warsaw",
+        "Romance Standard Time" => "Europe/Paris",
+        "E. Europe Standard Time" => "Europe/Chisinau",
+        "Russian Standard Time" => "Europe/Moscow",
+        "Turkey Standard Time" => "Europe/Istanbul",
+        "Israel Standard Time" => "Asia/Jerusalem",
+        "Arab Standard Time" => "Asia/Riyadh",
+        "India Standard Time" => "Asia/Kolkata",
+        "Bangladesh Standard Time" => "Asia/Dhaka",
+        "SE Asia Standard Time" => "Asia/Bangkok",
+        "China Standard Time" => "Asia/Shanghai",
+        "Taipei Standard Time" => "Asia/Taipei",
+        "Singapore Standard Time" => "Asia/Singapore",
+        "W. Australia Standard Time" => "Australia/Perth",
+        "Tokyo Standard Time" => "Asia/Tokyo",
+        "Korea Standard Time" => "Asia/Seoul",
+        "AUS Eastern Standard Time" => "Australia/Sydney",
+        "New Zealand Standard Time" => "Pacific/Auckland",
+        _ => return None,
+    })
+}
+
+/// Reads the Windows timezone (id + current base offset) by asking PowerShell.
+#[cfg(windows)]
+fn windows_zone() -> Option<Zone> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$tz=Get-TimeZone; Write-Output $tz.Id; Write-Output ([int]($tz.BaseUtcOffset.TotalSeconds))",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let id = lines.next()?;
+    let base_offset = lines.next().and_then(|v| v.parse::<i32>().ok());
+    if let Some(iana) = windows_tz_to_iana(id) {
+        return Some(Zone::Named(iana.to_owned()));
+    }
+    base_offset.map(Zone::Offset)
+}
+
+#[cfg(not(windows))]
+fn windows_zone() -> Option<Zone> {
+    None
+}
+
 /// Reads the system zone name (`/etc/localtime` symlink or `/etc/timezone`).
 pub fn from_system() -> Option<Zone> {
+    if let Some(zone) = windows_zone() {
+        return Some(zone);
+    }
     for candidate in ["/etc/timezone", "/var/db/zoneinfo"] {
         if let Ok(name) = std::fs::read_to_string(candidate) {
             let name = name.trim();
@@ -353,6 +423,15 @@ mod tests {
         let ts2 = 1_789_182_000i64;
         assert_eq!(Zone::Offset(0).date_at(ts2), "2026-09-12");
         assert_eq!(Zone::Offset(-8 * 3600).date_at(ts2), "2026-09-11");
+    }
+
+    #[test]
+    fn windows_timezone_ids_map_to_iana_names() {
+        assert_eq!(windows_tz_to_iana("China Standard Time"), Some("Asia/Shanghai"));
+        assert_eq!(windows_tz_to_iana("Taipei Standard Time"), Some("Asia/Taipei"));
+        assert_eq!(windows_tz_to_iana("Pacific Standard Time"), Some("America/Los_Angeles"));
+        assert_eq!(windows_tz_to_iana("UTC"), Some("Etc/UTC"));
+        assert_eq!(windows_tz_to_iana("Nowhere Standard Time"), None);
     }
 
     #[test]

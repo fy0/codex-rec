@@ -137,7 +137,7 @@ fn rewrite_item_parts(
         if !text.contains("<environment_context>") {
             continue;
         }
-        if let Some(updated) = rewrite_block(section, &text, zone, now, notes) {
+        if let Some(updated) = rewrite_all_blocks(section, &text, zone, now, notes) {
             if let Some(slot) = part.get_mut("text") {
                 *slot = Value::String(updated);
             }
@@ -145,6 +145,54 @@ fn rewrite_item_parts(
         }
     }
     touched_parts
+}
+
+/// Applies `rewrite_block` to **every** `<environment_context>` block in `text`.
+///
+/// A text part normally holds exactly one block, but an aggregated session can carry several (one per
+/// environment). Editing only the first one left the others reporting the client's own timezone.
+fn rewrite_all_blocks(
+    section: &EnvironmentSection,
+    text: &str,
+    zone: &mut Option<Zone>,
+    now: Option<i64>,
+    notes: &mut Notes,
+) -> Option<String> {
+    let open = "<environment_context>";
+    let close = "</environment_context>";
+    if !text.contains(open) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut touched = false;
+    while let Some(start) = rest.find(open) {
+        // text before the block stays as-is
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start..];
+        match after_open.find(close) {
+            Some(rel_end) => {
+                let end = rel_end + close.len();
+                let block = &after_open[..end];
+                match rewrite_block(section, block, zone, now, notes) {
+                    Some(updated) => {
+                        out.push_str(&updated);
+                        touched = true;
+                    }
+                    None => out.push_str(block),
+                }
+                rest = &after_open[end..];
+            }
+            None => {
+                // unterminated: keep the remainder verbatim and stop
+                out.push_str(after_open);
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    touched.then_some(out)
 }
 
 fn rewrite_block(
@@ -504,6 +552,26 @@ current_date = \"auto\"").unwrap();
         let rewritten = parts[1]["text"].as_str().unwrap();
         assert!(rewritten.contains("<timezone>+08:00</timezone>"), "{rewritten}");
         assert!(rewritten.contains("<current_date>2026-09-13</current_date>"), "{rewritten}");
+    }
+
+    /// Two blocks in a single part (one per environment) must both be rewritten.
+    #[test]
+    fn rewrites_every_block_in_a_part() {
+        let section: EnvironmentSection =
+            toml::from_str("timezone = \"+08:00\"
+current_date = \"auto\"").unwrap();
+        let two = format!("{BLOCK}
+middle text
+{BLOCK}");
+        let mut b = json!({
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": two}]}]
+        });
+        let notes = apply_env(&section, &mut b, Some(NOW));
+        assert!(notes.changed);
+        let text = b["input"][0]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text.matches("<timezone>+08:00</timezone>").count(), 2, "{text}");
+        assert!(text.contains("middle text"), "the text between the blocks must survive");
     }
 
     #[test]

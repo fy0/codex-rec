@@ -92,6 +92,17 @@ CI builds and attaches two artifacts per release:
 
 
 
+## v0.6.4
+
+Two follow-ups found by auditing for the same class of bug as v0.6.3 (a silent skip):
+
+* **Every `<environment_context>` block in a text part is rewritten**, not just the first. A text part
+  normally carries one, but an aggregated session can carry several (one per environment); the others
+  used to keep reporting the client's own timezone.
+* **Never send plain bytes with `content-encoding: zstd`.** When re-compression is impossible (no
+  zstd CLI) the rewrite is now skipped and reported instead of forwarding an uncompressed body under
+  a zstd header, which the upstream would fail to decode.
+
 ## v0.6.3
 
 * **Fixed: the environment rewrite only looked at the first text part of a message.** The real client

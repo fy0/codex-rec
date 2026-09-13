@@ -501,12 +501,25 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                         }
                     }
                     let new = serde_json::to_vec(&v).unwrap_or_default();
-                    body_out = if cenc.is_some() {
-                        summary::zstd_encode(&new).unwrap_or(new)
+                    if cenc.is_some() {
+                        // The client compressed this body, so the upstream expects a zstd frame.
+                        // If we cannot re-compress (no zstd CLI) we must NOT hand over plain bytes
+                        // together with `content-encoding: zstd` — that would corrupt the request.
+                        match summary::zstd_encode(&new) {
+                            Some(recompressed) => {
+                                body_out = recompressed;
+                                rewritten = true;
+                            }
+                            None => {
+                                eprintln!(
+                                    "[body rewrite skipped] the body was zstd-compressed and cannot be                                      re-compressed without the zstd CLI: set $ZSTD or put zstd(.exe) on                                      PATH (the request was forwarded unchanged)"
+                                );
+                            }
+                        }
                     } else {
-                        new
-                    };
-                    rewritten = true;
+                        body_out = new;
+                        rewritten = true;
+                    }
                 }
                 _ => eprintln!("[body rewrite skipped] body is not a JSON object"),
             },

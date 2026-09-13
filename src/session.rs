@@ -140,6 +140,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn session_file_name_is_pinned_on_first_write() {
+        let sessions = Sessions::new(std::env::temp_dir().join("codex-rec-test-pin"));
+        let first = sessions.path("sess-pin");
+        sessions.note_title("sess-pin", "A Real Title");
+        let second = sessions.path("sess-pin");
+        assert_eq!(first, second, "the file must not move once a session has been written");
+        assert!(first.to_string_lossy().contains("untitled"), "{first:?}");
+        // a title that is already known when the session is first written *does* name the file
+        sessions.note_title("sess-early", "Known Early");
+        assert!(sessions.path("sess-early").to_string_lossy().contains("known-early"));
+    }
+
+    #[test]
     fn date_conversion_matches_known_days() {
         assert_eq!(timeutil::civil_from_days(0), (1970, 1, 1));
         assert_eq!(timeutil::civil_from_days(20_000), (2024, 10, 4));

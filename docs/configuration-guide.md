@@ -18,23 +18,39 @@ session_dir     = "/root/sessions"
 
 ## 1. `[persona]` — the device identity (most important section)
 
-The persona decides what **identity the upstream sees**. Every field has three states:
+The persona decides what **identity the upstream sees**. Every field has two states, decided by
+whether the key is present at all:
 
 | Written as | Effect |
 |---|---|
-| key **absent** | inherit the value the client sent (nothing is rewritten) |
-| `"inherit"` | same as absent (readable alias) |
-| any other value | replace that part |
-| `""` | **only valid for `terminal`** (removes the terminal segment) |
+| key **absent** (or commented out) | **inherit** the value the client sent — nothing is rewritten |
+| key present with a value | replace that part |
+| `terminal = ""` | remove the terminal segment entirely (**only** `terminal` may be empty) |
+
+**Recommended style: keep the fields you want to inherit commented out.** That way the file states
+explicitly which parts are pinned and which follow the client, instead of repeating a magic word:
+
+```toml
+[persona]
+originator    = "codex-tui"    # pinned
+codex_version = "0.145.0"      # pinned
+# os          = ...            # commented out -> inherit the client's OS string
+# arch        = ...            # commented out -> inherit the client's architecture
+# terminal    = ...            # commented out -> inherit the client's terminal
+# user_agent  = ...            # commented out -> inherit the whole User-Agent
+```
+
+`"inherit"` is still accepted as an explicit value (useful when a value is generated or when the key
+must be present), but it is no longer the recommended way to express the default.
 
 ```toml
 [persona]
 originator    = "codex-tui"     # `originator` header + product name in the User-Agent
 codex_version = "0.145.0"       # both version segments of the User-Agent
-os            = "inherit"       # "<OS> <version>" part, e.g. "Debian 12.0.0"
-arch          = "inherit"       # "x86_64", "arm64", ...
-terminal      = "inherit"       # terminal segment (see §2)
-user_agent    = "inherit"       # escape hatch: a complete literal User-Agent
+# os          = ...            # commented out = inherit "<OS> <version>", e.g. "Debian 12.0.0"
+# arch        = ...            # commented out = inherit "x86_64" / "arm64" / ...
+# terminal    = ...            # commented out = inherit the terminal segment (see §2)
+# user_agent  = ...            # commented out = inherit the whole User-Agent
 rewrite_client_version = false  # also rewrite `?client_version=` (needs codex_version)
 ```
 
@@ -58,8 +74,9 @@ Notes that matter in practice:
   catalog (e.g. before `0.153.0` there is no `gpt-6-astra`), which turns into
   "Model metadata … not found" at startup. Keep the flag off and the mask only changes the header.
 * Empty values for `originator` / `codex_version` / `os` / `arch` / `user_agent` are rejected at
-  startup (they would produce an invalid User-Agent); omit the key or write `"inherit"` instead.
-* Nothing is rewritten when every field is absent/`inherit` — the section is inert.
+  startup (they would produce an invalid User-Agent); leave the key out (commented) instead.
+* Nothing is rewritten when every field is absent — the section is inert. A `[persona]` block whose
+  fields are all commented out is therefore a no-op that documents intent.
 
 ---
 
@@ -91,7 +108,7 @@ Multiplexers are tracked separately and appear as a second token in practice (`t
 **Consequences for the persona.** `terminal` is a free-form string here, so any of the values above
 is valid, plus:
 * a literal (`"WindowsTerminal"`, `"iTerm.app/3.5.0"`, `"xterm-256color"`) to pin a fixed look;
-* `"inherit"`/absent to keep whatever the real client sent;
+* the key commented out (or absent) to keep whatever the real client sent;
 * `""` to drop the segment entirely (`codex-tui/0.145.0 (Debian 12.0.0; x86_64) (codex-tui; 0.145.0)`).
 
 Remember the shell is *not* the terminal: PowerShell inside Windows Terminal yields
@@ -248,9 +265,9 @@ session_dir     = "/root/sessions"
 [persona]
 originator    = "codex-tui"
 codex_version = "0.145.0"
-os            = "inherit"
-arch          = "inherit"
-terminal      = "inherit"
+# os          = ...            # inherit
+# arch        = ...            # inherit
+# terminal    = ...            # inherit
 rewrite_client_version = false
 
 [headers.request]

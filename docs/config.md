@@ -19,8 +19,8 @@ log_dir  = "/root/rec"
 
 # ---------------------------------------------------------------- device persona
 # Each field has three states, decided by whether the key is present:
-#   - key absent      -> inherit the client's value (nothing is rewritten)
-#   - "inherit"       -> same as absent, kept as a readable alias
+#   - key absent (or commented out) -> inherit the client's value (nothing is rewritten)
+#   - "inherit"       -> same as absent, still accepted but no longer the recommended style
 #   - any other value -> use that value
 #   - "" is only valid for `terminal` (it removes the terminal segment); an empty
 #     originator/codex_version/os/arch/user_agent is a config error instead of a broken UA
@@ -30,7 +30,7 @@ codex_version = "0.145.0"          # User-Agent version segments (+ ?client_vers
 os            = "Debian 12.0.0"    # the "<os>; <arch>" part of the User-Agent
 arch          = "x86_64"
 terminal      = "tmux/3.3a"        # "" removes the terminal segment entirely
-user_agent    = "inherit"          # escape hatch: a literal User-Agent, wins over all of the above
+# user_agent  = ...                # commented out = inherit the whole User-Agent
 rewrite_client_version = true      # also rewrite ?client_version= on /models
 
 # ---------------------------------------------------------------- header rewriting
@@ -81,8 +81,8 @@ Whether a key is **present** decides what happens — there are no hidden defaul
 
 | config | effect |
 |---|---|
-| key absent | inherit the client's value |
-| `field = "inherit"` | same as absent (readable alias) |
+| key absent / commented out | inherit the client's value (**recommended way to express this**) |
+| `field = "inherit"` | same as absent; accepted for compatibility, not recommended |
 | `field = "some value"` | use that value |
 | `field = ""` | only valid for `terminal`: removes the terminal segment. Anywhere else it is a config error |
 

@@ -37,13 +37,13 @@ base_url = "http://127.0.0.1:18080/backend-api/codex"
 [persona]
 originator    = "codex-tui"
 codex_version = "0.145.0"
-os            = "inherit"      # keep the client's OS string
-arch          = "inherit"
-terminal      = "inherit"
+# os          = ...            # commented out = inherit the client's OS string
+# arch        = ...            # commented out = inherit the client's architecture
+# terminal    = ...            # commented out = inherit the client's terminal
 ```
 
-Only the fields you name are touched; everything else passes through untouched. A request that
-arrives as
+Only the fields you name are touched; everything else passes through untouched — leaving a key out
+(commented out) is the recommended way to say "inherit the client's value". A request that arrives as
 
 ```
 user-agent: codex-tui/0.153.4 (Debian 12.0.0; x86_64) xterm-256color (codex-tui; 0.153.4)
@@ -62,7 +62,7 @@ user-agent: codex-tui/0.145.0 (Debian 12.0.0; x86_64) xterm-256color (codex-tui;
 | | |
 |---|---|
 | recording | incoming/outgoing headers, raw + zstd-decoded bodies, streamed responses, per-request summaries (`model`, `service_tier`, reasoning effort, `client_metadata`), and the Cloudflare `__oailb` origin pool decoded from every response |
-| persona | three-state fields per attribute, decided by whether the key is present: absent = inherit the client's value, `"inherit"` = the same, any value = replace it (`terminal = ""` removes the segment) |
+| persona | fields decided by whether the key is present: absent/commented out = inherit the client's value, any value = replace it (`"inherit"` is still accepted as an alias, `terminal = ""` removes the segment) |
 | header rewriting | drop/set both directions, from the config file or CLI flags; `drop` patterns are globs (`cf-*`) |
 | path mapping | `[routes]` maps `/v1` or `/` onto the codex path `/backend-api/codex` for non-codex clients; codex itself keeps using `/backend-api/codex` |
 | body rewriting | remove/replace JSON keys (zstd is decoded and re-encoded automatically) |
@@ -115,3 +115,6 @@ CI builds and attaches two artifacts per release:
 * Session-capture events now carry `body_file` / `summary_file` / `response_file` pointers.
 
 See `docs/configuration-guide.md` for the annotated reference.
+
+The annotated reference for every key (including the terminal values codex can produce) is
+`docs/configuration-guide.md`.

@@ -126,7 +126,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set +e
-          gh run view ${{ github.run_id }} --log-failed > failed.log 2>&1
+          gh run view ${{ github.run_id }} --repo ${{ github.repository }} --log-failed > failed.log 2>&1
+          echo "gh exit: $?" >> failed.log
           echo "fetched $(wc -l < failed.log) lines of failed-job output"
 
       - name: Compose status file
@@ -154,10 +155,10 @@ jobs:
               for g in "$d"/glibc-*.txt; do
                 if [ -f "$g" ]; then echo "artifact $n: $(cat "$g")"; fi
               done
-              for l in "$d"/build-*.log; do
+              for l in "$d"/build-*.log "$d"/test-*.log; do
                 if [ -f "$l" ]; then
                   echo "--- tail $(basename "$l") ---"
-                  tail -n 120 "$l"
+                  tail -n 200 "$l"
                 fi
               done
             done

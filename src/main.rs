@@ -1,39 +1,30 @@
 //! codex-rec: a recording + forwarding HTTP/1.1 reverse proxy for the Codex backend.
 //!
-//! v0.2.0 adds a configurable **device persona** (override-or-inherit per field), TOML
-//! configuration, header rewriting from the config file and a TLS extension-order switch.
+//! v0.4.0 records one directory per codex session (see [`record`]), summarizes responses while they
+//! stream (see [`summary`]), bounds memory with `[limits]` (see [`body`]) and lets every artifact be
+//! switched off — `[record] enabled = false` turns it into a pure forwarder.
 //!
-//! TLS: the Linux codex client uses native-tls / a bundled OpenSSL and sends **no ALPN**, so
-//! the default backend here reproduces that ClientHello byte-for-byte (measured JA3
+//! TLS: the Linux codex client uses native-tls / a bundled OpenSSL and sends **no ALPN**, so the
+//! default backend here reproduces that ClientHello byte-for-byte (measured JA3
 //! `0b85eb0d4981e69064e40753e4f0ac5f` with SNI, `23211f2b48104c7030b93680a2efcfd0` without).
 //! `tls.extension_order = "randomize"` switches to the rustls backend, whose ClientHello shuffles
 //! the extension order per connection (OpenSSL has no such option).
-//!
-//! Recording layout (under `log_dir`):
-//!   index.jsonl               one compact line per request/response
-//!   req-<stamp>.hdr           incoming request line + headers (secrets redacted)
-//!   req-<stamp>.out.hdr       what we actually sent upstream (after persona + rewrites)
-//!   req-<stamp>.body/.json    raw and decompressed request body
-//!   req-<stamp>.summary.json  model / service_tier / effort / instructions / client_metadata
-//!   resp-<stamp>.hdr          status + headers, with the __oailb origin host decoded
-//!   resp-<stamp>.sse          raw streamed response
-//!   resp-<stamp>.summary.json model(s) seen / service_tier(s) / response ids / errors / answer
 
+mod body;
 mod config;
 mod persona;
+mod record;
 mod session;
+mod summary;
+mod timeutil;
 
-use std::collections::BTreeMap;
-use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::pin::Pin;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -42,13 +33,12 @@ use axum::routing::any;
 use axum::Router;
 use futures_util::Stream;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use config::{Config, ExtensionOrder};
+use record::{thread_from_metadata, Recorder};
 use session::Sessions;
+use summary::{summarize_request, Summarizer};
 
-const MAX_BODY: usize = 64 * 1024 * 1024;
-const MAX_ACC: usize = 32 * 1024 * 1024;
 const HOP_BY_HOP: &[&str] = &[
     "host",
     "connection",
@@ -62,27 +52,14 @@ const HOP_BY_HOP: &[&str] = &[
 struct App {
     cfg: Config,
     client: reqwest::Client,
+    recorder: Arc<Recorder>,
     sessions: Option<Arc<Sessions>>,
 }
 
 // ---------------------------------------------------------------- helpers
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn stamp() -> String {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{n}-{seq}")
-}
-
 fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+    timeutil::now_ms()
 }
 
 fn redact(name: &str, value: &str) -> String {
@@ -92,45 +69,6 @@ fn redact(name: &str, value: &str) -> String {
         return format!("{head}...[redacted {} bytes]", value.len());
     }
     value.to_owned()
-}
-
-/// Runs the system `zstd` CLI (`mode` is `-d` or `-3`).
-fn zstd_cli(mode: &str, input: &[u8]) -> Option<Vec<u8>> {
-    let mut child = Command::new("zstd")
-        .arg(mode)
-        .arg("-q")
-        .arg("-c")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
-    let data = input.to_vec();
-    let feeder = std::thread::spawn(move || {
-        let _ = stdin.write_all(&data);
-        drop(stdin);
-    });
-    let out = child.wait_with_output().ok()?;
-    let _ = feeder.join();
-    if out.status.success() {
-        Some(out.stdout)
-    } else {
-        None
-    }
-}
-
-fn decode_body(raw: &[u8], cenc: Option<&str>) -> Option<Vec<u8>> {
-    match cenc {
-        Some(e) if e.to_ascii_lowercase().contains("zstd") => zstd_cli("-d", raw),
-        _ => Some(raw.to_vec()),
-    }
-}
-
-fn short_hash(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.finalize().iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
@@ -183,141 +121,56 @@ fn decode_oailb(headers: &[String]) -> Option<String> {
     None
 }
 
-// ---------------------------------------------------------------- summaries
-
-fn summarize_request(body: &Value) -> Value {
-    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
-    let mut msg_chars = 0usize;
-    let mut last_user = String::new();
-    if let Some(items) = body.get("input").and_then(|v| v.as_array()) {
-        for it in items {
-            let kind = it
-                .get("type")
-                .and_then(|v| v.as_str())
-                .or_else(|| it.get("role").and_then(|v| v.as_str()))
-                .unwrap_or("?")
-                .to_owned();
-            *kinds.entry(kind).or_insert(0) += 1;
-            let mut text = String::new();
-            if let Some(parts) = it.get("content").and_then(|v| v.as_array()) {
-                for c in parts {
-                    if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
-                        text.push_str(t);
-                    }
-                }
-            }
-            msg_chars += text.len();
-            if it.get("role").and_then(|v| v.as_str()) == Some("user") && !text.is_empty() {
-                last_user = text.chars().take(400).collect();
-            }
-        }
-    }
-    let instructions = body.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
-    json!({
-        "model": body.get("model"),
-        "service_tier": body.get("service_tier"),
-        "reasoning": body.get("reasoning"),
-        "stream": body.get("stream"),
-        "instructions_len": instructions.len(),
-        "instructions_sha": short_hash(instructions.as_bytes()),
-        "prompt_cache_key": body.get("prompt_cache_key"),
-        "tools": body.get("tools").and_then(|v| v.as_array()).map(|a| a.len()),
-        "items": body.get("input").and_then(|v| v.as_array()).map(|a| a.len()),
-        "item_kinds": kinds,
-        "message_chars": msg_chars,
-        "client_metadata_keys": body
-            .get("client_metadata")
-            .and_then(|v| v.as_object())
-            .map(|o| o.keys().cloned().collect::<Vec<_>>()),
-        "last_user": last_user,
-    })
-}
-
-fn summarize_response(text: &str) -> Value {
-    let mut models: Vec<String> = Vec::new();
-    let mut tiers: Vec<String> = Vec::new();
-    let mut ids: Vec<String> = Vec::new();
-    let mut events: BTreeMap<String, usize> = BTreeMap::new();
-    let mut errors: Vec<String> = Vec::new();
-    let mut metadata_frames: Vec<String> = Vec::new();
-    let mut answer = String::new();
-    for line in text.lines() {
-        let t = line.trim();
-        // HTTP/SSE responses prefix every JSON frame with `data: `; WebSocket frames do not.
-        let t = t.strip_prefix("data:").map(str::trim).unwrap_or(t);
-        if !t.starts_with('{') {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(t) else { continue };
-        if let Some(ty) = v.get("type").and_then(|x| x.as_str()) {
-            *events.entry(ty.to_owned()).or_insert(0) += 1;
-            if ty == "codex.response.metadata" {
-                if let Some(h) = v.get("headers") {
-                    metadata_frames.push(h.to_string());
-                }
-            }
-            if ty.contains("error") || ty.contains("failed") {
-                errors.push(t.chars().take(300).collect());
-            }
-            if ty == "response.output_text.delta" {
-                if let Some(d) = v.get("delta").and_then(|x| x.as_str()) {
-                    answer.push_str(d);
-                }
-            }
-        }
-        if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
-            if !models.iter().any(|e| e == m) {
-                models.push(m.to_owned());
-            }
-        }
-        if let Some(s) = v.get("service_tier").and_then(|x| x.as_str()) {
-            if !tiers.iter().any(|e| e == s) {
-                tiers.push(s.to_owned());
-            }
-        }
-        for key in ["id", "response_id"] {
-            if let Some(id) = v.get(key).and_then(|x| x.as_str()) {
-                if id.starts_with("resp_") && !ids.iter().any(|e| e == id) {
-                    ids.push(id.to_owned());
-                }
-            }
-        }
-    }
-    json!({
-        "models_seen": models,
-        "service_tiers_seen": tiers,
-        "response_ids": ids,
-        "events": events,
-        "errors": errors,
-        "metadata_frames": metadata_frames,
-        "answer_chars": answer.len(),
-        "answer": answer.chars().take(4000).collect::<String>(),
-    })
-}
-
 fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     f.write_all(line.as_bytes())?;
     f.write_all(b"\n")
+}
+
+/// Writes a file only when there is something to write (empty artifacts are skipped).
+fn write_if_any(path: &Path, bytes: &[u8], buffered: usize) {
+    if bytes.is_empty() {
+        return;
+    }
+    if buffered == 0 {
+        let _ = fs::write(path, bytes);
+        return;
+    }
+    if let Ok(file) = File::create(path) {
+        let mut writer = BufWriter::with_capacity(buffered, file);
+        let _ = writer.write_all(bytes);
+        let _ = writer.flush();
+    }
 }
 
 fn header_dump(lines: &[String]) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+fn text_response(code: u16, msg: &str) -> Response {
+    Response::builder()
+        .status(code)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(msg.to_owned()))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
 // ---------------------------------------------------------------- tee
 
 struct Sink {
-    file: Option<File>,
-    acc: Vec<u8>,
-    prefix: String,
-    log_dir: PathBuf,
-    req_stamp: String,
+    cfg: Config,
+    plan: Option<record::Plan>,
+    file: Option<BufWriter<File>>,
+    recorded: Option<String>,
+    summarizer: Option<Summarizer>,
     status: u16,
     origin: Option<String>,
-    persona: Vec<String>,
-    sessions: Option<Arc<Sessions>>,
+    index_row: Option<Value>,
     session_id: Option<String>,
+    sessions: Option<Arc<Sessions>>,
+    spilled: Option<std::path::PathBuf>,
+    finished: bool,
 }
 
 impl Sink {
@@ -325,31 +178,56 @@ impl Sink {
         if let Some(f) = self.file.as_mut() {
             let _ = f.write_all(chunk);
         }
-        if self.acc.len() < MAX_ACC {
-            self.acc.extend_from_slice(chunk);
+        if let Some(s) = self.summarizer.as_mut() {
+            s.push(chunk);
         }
     }
 
     fn finish(&mut self) {
-        let text = String::from_utf8_lossy(&self.acc).to_string();
-        let summary = summarize_response(&text);
-        let _ = fs::write(
-            self.log_dir.join(format!("resp-{}.summary.json", self.prefix)),
-            serde_json::to_vec_pretty(&summary).unwrap_or_default(),
-        );
-        let line = json!({
-            "req": self.req_stamp,
-            "status": self.status,
-            "origin": self.origin,
-            "persona": self.persona,
-            "models_seen": summary.get("models_seen"),
-            "service_tiers_seen": summary.get("service_tiers_seen"),
-            "response_ids": summary.get("response_ids"),
-            "events": summary.get("events"),
-            "errors": summary.get("errors"),
-            "answer_chars": summary.get("answer_chars"),
-        });
-        let _ = append_line(&self.log_dir.join("index.jsonl"), &line.to_string());
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.flush();
+        }
+        let summary = match self.summarizer.as_mut() {
+            Some(s) => s.finish(self.recorded.clone()),
+            None => Value::Null,
+        };
+
+        let mut index = self.index_row.take().unwrap_or_else(|| json!({}));
+        if let Some(obj) = index.as_object_mut() {
+            obj.insert("status".to_owned(), json!(self.status));
+            obj.insert("origin".to_owned(), json!(self.origin));
+            obj.insert("response_file".to_owned(), json!(self.recorded));
+            obj.insert("models_seen".to_owned(), summary.get("models_seen").cloned().unwrap_or(Value::Null));
+            obj.insert(
+                "service_tiers_seen".to_owned(),
+                summary.get("service_tiers_seen").cloned().unwrap_or(Value::Null),
+            );
+            obj.insert("response_ids".to_owned(), summary.get("response_ids").cloned().unwrap_or(Value::Null));
+            obj.insert("events".to_owned(), summary.get("events").cloned().unwrap_or(Value::Null));
+            obj.insert("errors".to_owned(), summary.get("errors").cloned().unwrap_or(Value::Null));
+            obj.insert("usage".to_owned(), summary.get("usage").cloned().unwrap_or(Value::Null));
+            obj.insert(
+                "answer_chars".to_owned(),
+                summary.get("answer_chars").cloned().unwrap_or(Value::Null),
+            );
+        }
+
+        if self.cfg.record.index {
+            let _ = append_line(&self.cfg.log_dir.join("index.jsonl"), &index.to_string());
+        }
+        if let Some(plan) = self.plan.as_ref() {
+            if self.cfg.record.response_summary {
+                let _ = write_if_any(
+                    &plan.resp("summary.json"),
+                    serde_json::to_vec_pretty(&summary).unwrap_or_default().as_slice(),
+                    self.cfg.limits.write_buffer_bytes,
+                );
+            }
+        }
         if let (Some(sessions), Some(session)) = (self.sessions.as_ref(), self.session_id.as_deref()) {
             sessions.append(
                 session,
@@ -358,10 +236,22 @@ impl Sink {
                     "ts": now_ms(),
                     "status": self.status,
                     "origin": self.origin,
+                    "dir": self.plan.as_ref().map(|p| p.dir().to_string_lossy().to_string()),
+                    "response_file": self.recorded,
                     "summary": summary,
                 }),
             );
         }
+        if let Some(path) = self.spilled.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+impl Drop for Sink {
+    fn drop(&mut self) {
+        // A client that disconnects mid-stream still gets a summary + index row.
+        self.finish();
     }
 }
 
@@ -408,20 +298,14 @@ impl Stream for TeeStream {
 
 // ---------------------------------------------------------------- handler
 
-fn text_response(code: u16, msg: &str) -> Response {
-    Response::builder()
-        .status(code)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Body::from(msg.to_owned()))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
-}
-
 async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Response {
     let cfg = &app.cfg;
-    let (parts, body) = req.into_parts();
+    let record = &app.recorder.record;
+    let (parts, incoming_body) = req.into_parts();
     let method = parts.method.clone();
-    // `uri_in` is what the client asked for (logged as-is); `uri` is what we actually send
-    // upstream after the [routes] path mapping. Both are recorded, so the mapping stays auditable.
+
+    // `uri_in` is what the client asked for (logged as-is); `uri` is what we send upstream after the
+    // [routes] path mapping. Both are recorded, so the mapping stays auditable.
     let uri_in = parts.uri.to_string();
     let (in_path, in_query) = match uri_in.split_once('?') {
         Some((path, query)) => (path.to_owned(), Some(query.to_owned())),
@@ -432,13 +316,6 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
         uri.push('?');
         uri.push_str(&query);
     }
-    let req_stamp = stamp();
-    let prefix = req_stamp.clone();
-
-    let body_bytes = match axum::body::to_bytes(body, MAX_BODY).await {
-        Ok(b) => b,
-        Err(e) => return text_response(400, &format!("body read error: {e}")),
-    };
 
     let session_id = parts
         .headers
@@ -446,8 +323,18 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
         .or_else(|| parts.headers.get("thread-id"))
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let thread = thread_from_metadata(
+        parts
+            .headers
+            .get("x-codex-turn-metadata")
+            .and_then(|v| v.to_str().ok()),
+    );
+    let plan = app
+        .recorder
+        .enabled()
+        .then(|| app.recorder.plan(session_id.as_deref(), &thread));
 
-    // ---- incoming request capture + outgoing header assembly
+    // ---- incoming header capture + outgoing header assembly
     let mut incoming_lines: Vec<String> = Vec::new();
     let mut out_headers = reqwest::header::HeaderMap::new();
     let mut cenc = None;
@@ -473,40 +360,121 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
             out_headers.insert(hn, hv);
         }
     }
-    let _ = fs::write(
-        cfg.log_dir.join(format!("req-{req_stamp}.hdr")),
-        format!("{method} {uri_in}\n{}", header_dump(&incoming_lines)),
-    );
-    let _ = fs::write(cfg.log_dir.join(format!("req-{req_stamp}.body")), &body_bytes);
+    if let Some(plan) = plan.as_ref() {
+        if record.request_headers {
+            let _ = write_if_any(
+                &plan.req("hdr"),
+                format!("{method} {uri_in}\n{}", header_dump(&incoming_lines)).as_bytes(),
+                cfg.limits.write_buffer_bytes,
+            );
+        }
+    }
 
-    // ---- device persona (override-or-inherit) then configured header rewrites
+    // ---- device persona, then configured header rewrites
     let persona_notes = persona::apply(cfg, &mut out_headers, &mut uri);
-    let mut out_lines: Vec<String> = vec![format!("{method} {uri}")];
-    for (name, value) in cfg.request_rules.set.iter() {
+    for (name, value) in cfg.request_sets.iter() {
         if let (Ok(hn), Ok(hv)) = (
             reqwest::header::HeaderName::from_bytes(name.as_bytes()),
             reqwest::header::HeaderValue::from_str(value),
         ) {
             out_headers.insert(hn, hv);
-            out_lines.push(format!("{name}: {value}   <- set by config"));
         }
     }
-    for (k, v) in out_headers.iter() {
-        let name = k.as_str().to_ascii_lowercase();
-        if cfg.request_rules.set.keys().any(|s| s.eq_ignore_ascii_case(&name)) {
-            continue;
+    if let Some(plan) = plan.as_ref() {
+        if record.request_headers_out {
+            let mut out_lines: Vec<String> = vec![format!("{method} {uri}"), format!("x-incoming-path: {in_path}")];
+            for (name, value) in cfg.request_sets.iter() {
+                out_lines.push(format!(
+                    "{name}: {}   <- set by config",
+                    redact(name, value)
+                ));
+            }
+            for (k, v) in out_headers.iter() {
+                let name = k.as_str().to_ascii_lowercase();
+                if cfg.request_sets.iter().any(|(s, _)| s.eq_ignore_ascii_case(&name)) {
+                    continue;
+                }
+                out_lines.push(format!("{name}: {}", redact(&name, v.to_str().unwrap_or("<non-utf8>"))));
+            }
+            for note in persona_notes.iter() {
+                out_lines.push(format!("# persona: {note}"));
+            }
+            let _ = write_if_any(
+                &plan.req("out.hdr"),
+                header_dump(&out_lines).as_bytes(),
+                cfg.limits.write_buffer_bytes,
+            );
         }
-        out_lines.push(format!("{name}: {}", redact(&name, v.to_str().unwrap_or("<non-utf8>"))));
     }
-    for note in persona_notes.iter() {
-        out_lines.push(format!("# persona: {note}"));
-    }
-    let _ = fs::write(cfg.log_dir.join(format!("req-{req_stamp}.out.hdr")), header_dump(&out_lines));
 
-    // ---- optional body rewriting (JSON only; zstd via the CLI)
-    let mut body_out = body_bytes.to_vec();
-    if !cfg.body_drop.is_empty() || !cfg.body_set.is_empty() {
-        match decode_body(&body_bytes, cenc.as_deref()) {
+    // ---- request body: stream it through, or buffer/spill it
+    let rewrites_body = !cfg.body_drop.is_empty() || !cfg.body_set.is_empty();
+    let want_body = rewrites_body || (record.enabled && app.recorder.needs_request_decode());
+    let mut spilled: Option<std::path::PathBuf> = None;
+    let mut body_bytes: Vec<u8> = Vec::new();
+    let mut streamed_body = None;
+    let mut body_over_limit = false;
+    let mut body_total: u64 = 0;
+
+    if want_body {
+        let policy = body::Policy::parse(&cfg.limits.request_body_over_limit).unwrap_or(body::Policy::Spill);
+        let spill_target = std::env::temp_dir().join(format!(
+            "codex-rec-{}.body",
+            plan.as_ref().map(|p| p.stem().to_owned()).unwrap_or_else(|| timeutil::stamp())
+        ));
+        match body::read(incoming_body, cfg.limits.request_body_bytes, policy, &spill_target).await {
+            Ok(buffered) => {
+                body_over_limit = buffered.over_limit;
+                body_total = buffered.total;
+                if buffered.over_limit {
+                    eprintln!(
+                        "[request body over limits.request_body_bytes] {} bytes spilled to a file",
+                        buffered.total
+                    );
+                }
+                body_bytes = buffered.head.clone();
+                if let Some(path) = buffered.spill {
+                    let mut forward_path = path.clone();
+                    let mut delete_after = true;
+                    if record.enabled && record.request_body_raw && cenc.is_some() {
+                        // the spilled raw body *is* the recorded artifact: move it into place
+                        if let Some(plan) = plan.as_ref() {
+                            let dest = plan.req("body");
+                            let moved = fs::rename(&path, &dest).is_ok() || {
+                                let copied = fs::copy(&path, &dest).is_ok();
+                                if copied {
+                                    let _ = fs::remove_file(&path);
+                                }
+                                copied
+                            };
+                            if moved {
+                                forward_path = dest;
+                                delete_after = false;
+                            }
+                        }
+                    }
+                    streamed_body = Some(reqwest::Body::wrap_stream(body::file_body(forward_path)));
+                    spilled = delete_after.then_some(path);
+                }
+            }
+            Err(e) => {
+                let code = match e {
+                    body::BodyError::TooLarge(_) => 413,
+                    _ => 400,
+                };
+                return text_response(code, &e.message());
+            }
+        }
+    } else {
+        // nothing has to look at the body: pass it through without buffering it (pure-forwarder path)
+        streamed_body = Some(reqwest::Body::wrap_stream(incoming_body.into_data_stream()));
+    }
+
+    // ---- body decode / rewrite
+    let mut body_out: Vec<u8> = body_bytes.clone();
+    let mut rewritten = false;
+    if rewrites_body {
+        match summary::decode_body(&body_bytes, cenc.as_deref()) {
             Some(decoded) => match serde_json::from_slice::<Value>(&decoded) {
                 Ok(mut v) if v.is_object() => {
                     let obj = v.as_object_mut().unwrap();
@@ -520,10 +488,11 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                     }
                     let new = serde_json::to_vec(&v).unwrap_or_default();
                     body_out = if cenc.is_some() {
-                        zstd_cli("-3", &new).unwrap_or(new)
+                        summary::zstd_cli("-3", &new).unwrap_or(new)
                     } else {
                         new
                     };
+                    rewritten = true;
                 }
                 _ => eprintln!("[body rewrite skipped] body is not a JSON object"),
             },
@@ -531,67 +500,127 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
         }
     }
 
-    // ---- request body recording
-    if let Some(decoded) = decode_body(&body_bytes, cenc.as_deref()) {
-        let _ = fs::write(cfg.log_dir.join(format!("req-{req_stamp}.json")), &decoded);
-        if let Ok(v) = serde_json::from_slice::<Value>(&decoded) {
-            let summary = summarize_request(&v);
-            let _ = fs::write(
-                cfg.log_dir.join(format!("req-{req_stamp}.summary.json")),
-                serde_json::to_vec_pretty(&summary).unwrap_or_default(),
-            );
-            let line = json!({
-                "req": req_stamp,
-                "method": method.to_string(),
-                "uri": uri.clone(),
-                "persona": persona_notes.clone(),
-                "request": summary,
-            });
-            if let (Some(sessions), Some(session)) = (app.sessions.as_ref(), session_id.as_deref()) {
-                if let Some(text) = line
-                    .get("request")
-                    .and_then(|r| r.get("last_user"))
-                    .and_then(|v| v.as_str())
-                {
-                    sessions.note_title(session, text);
-                }
-                sessions.append(
-                    session,
-                    &json!({
-                        "type": "request",
-                        "ts": now_ms(),
-                        "uri": uri.clone(),
-                        "persona": persona_notes.clone(),
-                        "request": line.get("request"),
-                    }),
-                );
-            }
-            let _ = append_line(&cfg.log_dir.join("index.jsonl"), &line.to_string());
+    // ---- request artifacts
+    let mut request_summary = Value::Null;
+    let mut request_json_file: Option<String> = None;
+    if let Some(plan) = plan.as_ref() {
+        let compressed = cenc.is_some() && body_bytes.len() < 4 * 1024 * 1024;
+        if record.request_body_raw && compressed && spilled.is_none() {
+            write_if_any(&plan.req("body"), &body_bytes, cfg.limits.write_buffer_bytes);
         }
+        if record.request_body_out && rewritten && !body_out.is_empty() {
+            write_if_any(&plan.req("out.json"), &body_out, cfg.limits.write_buffer_bytes);
+        }
+        if (record.request_body_json || record.request_summary)
+            && !body_bytes.is_empty()
+            && !body_over_limit
+        {
+            if let Some(decoded) = summary::decode_body(&body_bytes, cenc.as_deref()) {
+                if record.request_body_json && !decoded.is_empty() {
+                    write_if_any(&plan.req("json"), &decoded, cfg.limits.write_buffer_bytes);
+                    request_json_file = Some(plan.req_name("json"));
+                }
+                if let Ok(v) = serde_json::from_slice::<Value>(&decoded) {
+                    request_summary = summarize_request(&v);
+                    if record.request_summary {
+                        let _ = write_if_any(
+                            &plan.req("summary.json"),
+                            serde_json::to_vec_pretty(&request_summary)
+                                .unwrap_or_default()
+                                .as_slice(),
+                            cfg.limits.write_buffer_bytes,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let index_row = if record.index {
+        json!({
+            "req": plan.as_ref().map(|p| p.stem().to_owned()),
+            "session": session_id,
+            "thread": thread,
+            "dir": plan.as_ref().map(|p| p.dir().to_string_lossy().to_string()),
+            "method": method.to_string(),
+            "uri_in": uri_in,
+            "uri": uri,
+            "persona": persona_notes,
+            "request": request_summary,
+            "request_file": request_json_file,
+            "request_body_bytes": body_total,
+            "request_body_spilled": body_over_limit,
+        })
+    } else {
+        Value::Null
+    };
+
+    if let (Some(sessions), Some(session)) = (app.sessions.as_ref(), session_id.as_deref()) {
+        if let Some(text) = request_summary.get("last_user").and_then(|v| v.as_str()) {
+            sessions.note_title(session, text);
+        }
+        sessions.append(
+            session,
+            &json!({
+                "type": "request",
+                "ts": now_ms(),
+                "uri_in": index_row.get("uri_in"),
+                "uri": index_row.get("uri"),
+                "persona": index_row.get("persona"),
+                "dir": plan.as_ref().map(|p| p.dir().to_string_lossy().to_string()),
+                "body_file": request_json_file,
+                "summary_file": if record.request_summary && request_summary != Value::Null {
+                    plan.as_ref().map(|p| p.req_name("summary.json"))
+                } else {
+                    None
+                },
+                "request": request_summary,
+            }),
+        );
     }
 
     // ---- forward
     let url = format!("{}{}", cfg.upstream, uri);
-    let mut builder = app
-        .client
-        .request(method.clone(), &url)
-        .headers(out_headers);
-    if !body_out.is_empty() {
+    let mut builder = app.client.request(method.clone(), &url).headers(out_headers);
+    if let Some(stream) = streamed_body {
+        builder = builder.body(stream);
+    } else if !body_out.is_empty() {
         builder = builder.body(body_out);
     }
     let resp = match builder.send().await {
         Ok(r) => r,
-        Err(e) => return text_response(502, &format!("upstream error: {e}")),
+        Err(e) => {
+            if let Some(path) = spilled {
+                let _ = fs::remove_file(path);
+            }
+            return text_response(502, &format!("upstream error: {e}"));
+        }
     };
 
     let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let etag = resp
+        .headers()
+        .get("x-models-etag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let resp_encoding = resp
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
     let mut resp_lines: Vec<String> = vec![format!("HTTP {}", status.as_u16())];
     let mut rb = Response::builder().status(status);
     if let Some(hs) = rb.headers_mut() {
         for (k, v) in resp.headers().iter() {
             let name = k.as_str().to_ascii_lowercase();
             let value = v.to_str().unwrap_or("<non-utf8>").to_owned();
-            resp_lines.push(format!("{name}: {value}"));
+            resp_lines.push(format!("{name}: {}", redact(&name, &value)));
             let dropped = cfg
                 .response_drop_globs
                 .as_ref()
@@ -611,7 +640,7 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                 hs.insert(hn, hv);
             }
         }
-        for (name, value) in cfg.response_rules.set.iter() {
+        for (name, value) in cfg.response_sets.iter() {
             if let (Ok(hn), Ok(hv)) = (
                 reqwest::header::HeaderName::from_bytes(name.as_bytes()),
                 reqwest::header::HeaderValue::from_str(value),
@@ -625,15 +654,24 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
     if let Some(o) = origin.as_ref() {
         resp_lines.push(format!("[decoded] __oailb origin = {o}"));
     }
-    let _ = fs::write(cfg.log_dir.join(format!("resp-{prefix}.hdr")), header_dump(&resp_lines));
+    let is_catalog = uri.contains("/models");
+    if let Some(plan) = plan.as_ref() {
+        if record.response_headers {
+            let _ = write_if_any(
+                &plan.resp("hdr"),
+                header_dump(&resp_lines).as_bytes(),
+                cfg.limits.write_buffer_bytes,
+            );
+        }
+    }
 
     // ---- optional catalog rewrite (buffered, non-streaming)
-    if cfg.rewrite_catalog && uri.contains("/models") {
+    if cfg.rewrite_catalog && is_catalog {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => return text_response(502, &format!("upstream read error: {e}")),
         };
-        let decoded = decode_body(&bytes, None).unwrap_or_else(|| bytes.to_vec());
+        let decoded = summary::decode_body(&bytes, resp_encoding.as_deref()).unwrap_or_else(|| bytes.to_vec());
         let rewritten = match serde_json::from_slice::<Value>(&decoded) {
             Ok(mut v) => {
                 if let Some(models) = v.get_mut("models").and_then(|m| m.as_array_mut()) {
@@ -649,7 +687,19 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
             }
             Err(_) => decoded,
         };
-        let _ = fs::write(cfg.log_dir.join(format!("resp-{prefix}.catalog.json")), &rewritten);
+        if let Some(plan) = plan.as_ref() {
+            let _ = write_if_any(
+                &plan.resp("catalog.json"),
+                &rewritten,
+                cfg.limits.write_buffer_bytes,
+            );
+        }
+        if let (Some(sessions), Some(session)) = (app.sessions.as_ref(), session_id.as_deref()) {
+            sessions.append(
+                session,
+                &json!({"type": "catalog_rewrite", "ts": now_ms(), "bytes": rewritten.len()}),
+            );
+        }
         return Response::builder()
             .status(status)
             .header("content-type", "application/json")
@@ -657,18 +707,79 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
             .unwrap_or_else(|_| text_response(500, "response build error"));
     }
 
-    let file = File::create(cfg.log_dir.join(format!("resp-{prefix}.sse"))).ok();
+    // ---- response body: record + summarize, or pass straight through
+    let keep_stream = app.recorder.tracks_response() && (!is_catalog || record.response_stream_catalog);
+    let want_summary = app.recorder.enabled() && record.response_summary;
+    if !keep_stream && !want_summary {
+        if let Some(path) = spilled {
+            let _ = fs::remove_file(path);
+        }
+        return rb
+            .body(Body::from_stream(resp.bytes_stream()))
+            .unwrap_or_else(|_| text_response(500, "response build error"));
+    }
+
+    let mut summarizer = if want_summary || !keep_stream {
+        let mut s = Summarizer::new(
+            content_type.as_deref(),
+            cfg.limits.summary_buffer_bytes,
+            plan.as_ref().map(|p| p.resp_name("stream.sse")).unwrap_or_default(),
+        );
+        s.set_etag(etag.clone());
+        s.set_response_encoding(resp_encoding.clone());
+        Some(s)
+    } else {
+        None
+    };
+    if let Some(s) = summarizer.as_mut() {
+        if !s.is_sse() && is_catalog && !record.response_stream_catalog {
+            s.mark_stream_skipped();
+        }
+    }
+
+    let recorded = if keep_stream {
+        plan.as_ref().map(|p| {
+            if content_type
+                .as_deref()
+                .map(|c| c.to_ascii_lowercase().contains("event-stream"))
+                .unwrap_or(false)
+            {
+                p.resp_name("stream.sse")
+            } else if is_catalog {
+                p.resp_name("stream.json")
+            } else {
+                p.resp_name("stream.bin")
+            }
+        })
+    } else {
+        None
+    };
+    let file = match (keep_stream, plan.as_ref(), recorded.as_ref()) {
+        (true, Some(plan), Some(name)) => File::create(plan.dir().join(name))
+            .ok()
+            .map(|f| {
+                if cfg.limits.write_buffer_bytes == 0 {
+                    BufWriter::with_capacity(8 * 1024, f)
+                } else {
+                    BufWriter::with_capacity(cfg.limits.write_buffer_bytes, f)
+                }
+            }),
+        _ => None,
+    };
+
     let sink = Arc::new(Mutex::new(Sink {
+        cfg: cfg.clone(),
+        plan: plan.clone(),
         file,
-        acc: Vec::new(),
-        prefix,
-        log_dir: cfg.log_dir.clone(),
-        req_stamp,
+        recorded: recorded.clone(),
+        summarizer: summarizer.take(),
         status: status.as_u16(),
         origin,
-        persona: persona_notes,
-        sessions: app.sessions.clone(),
+        index_row: Some(index_row),
         session_id: session_id.clone(),
+        sessions: app.sessions.clone(),
+        spilled,
+        finished: false,
     }));
     let stream = TeeStream {
         inner: Box::pin(resp.bytes_stream()),
@@ -763,7 +874,38 @@ async fn main() {
         cfg.listen,
         cfg.upstream
     );
-    println!("recording into {}", cfg.log_dir.display());
+    let record = cfg.record.clone();
+    if record.enabled {
+        println!(
+            "recording into {} (session dirs; retention={:?}d gzip={:?}d max={:?}B)",
+            cfg.log_dir.display(),
+            record.retention_days,
+            record.gzip_after_days,
+            record.max_total_bytes
+        );
+        println!(
+            "record switches: index={} req.hdr={} req.out.hdr={} req.body={} req.json={} req.summary={} resp.hdr={} resp.stream={} resp.catalog_stream={} resp.summary={}",
+            record.index,
+            record.request_headers,
+            record.request_headers_out,
+            record.request_body_raw,
+            record.request_body_json,
+            record.request_summary,
+            record.response_headers,
+            record.response_stream,
+            record.response_stream_catalog,
+            record.response_summary
+        );
+    } else {
+        println!("recording disabled ([record] enabled = false): pure forwarder");
+    }
+    println!(
+        "limits: request_body={} bytes (over-limit={}), summary_buffer={} bytes, write_buffer={} bytes",
+        cfg.limits.request_body_bytes,
+        cfg.limits.request_body_over_limit,
+        cfg.limits.summary_buffer_bytes,
+        cfg.limits.write_buffer_bytes
+    );
     println!(
         "routes: strip {:?} -> prefix {:?}",
         cfg.routes.strip_prefixes, cfg.routes.upstream_prefix
@@ -786,10 +928,25 @@ async fn main() {
         println!("session capture -> {}", cfg.session_dir.display());
         Arc::new(Sessions::new(cfg.session_dir.clone()))
     });
+    let recorder = Arc::new(Recorder::new(
+        cfg.log_dir.clone(),
+        cfg.record.clone(),
+        cfg.limits.clone(),
+    ));
+    if recorder.enabled() {
+        let pruner = Arc::clone(&recorder);
+        tokio::spawn(async move {
+            loop {
+                println!("{}", pruner.prune());
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+    }
     let client = build_client(&cfg);
     let app = Arc::new(App {
         cfg,
         client,
+        recorder,
         sessions,
     });
     let listen = app.cfg.listen.clone();

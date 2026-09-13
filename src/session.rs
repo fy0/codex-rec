@@ -13,13 +13,19 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+
+use crate::timeutil;
+
+const MAX_TITLES: usize = 4096;
 
 pub struct Sessions {
     dir: PathBuf,
     titles: Mutex<HashMap<String, String>>,
+    /// The file name is pinned the first time a session is written, so learning the title later
+    /// does not scatter one session across two files.
+    paths: Mutex<HashMap<String, PathBuf>>,
 }
 
 impl Sessions {
@@ -28,16 +34,27 @@ impl Sessions {
         Self {
             dir,
             titles: Mutex::new(HashMap::new()),
+            paths: Mutex::new(HashMap::new()),
         }
     }
 
     /// Remembers the title for a session (first non-empty title wins).
+    ///
+    /// The map is capped so a long-running recorder cannot grow without bound: once it is full the
+    /// oldest half of the entries is dropped (a stale title only affects the file name of a session
+    /// that has not been written to in a very long time).
     pub fn note_title(&self, session: &str, title: &str) {
         let slug = slugify(title);
         if slug.is_empty() {
             return;
         }
         if let Ok(mut map) = self.titles.lock() {
+            if map.len() >= MAX_TITLES && !map.contains_key(session) {
+                let keys: Vec<String> = map.keys().take(MAX_TITLES / 2).cloned().collect();
+                for key in keys {
+                    map.remove(&key);
+                }
+            }
             map.entry(session.to_owned()).or_insert(slug);
         }
     }
@@ -50,16 +67,33 @@ impl Sessions {
         }
     }
 
-    /// The file this session writes to (created lazily on the first append).
+    /// The file this session writes to. The name is decided on first use (title included when it is
+    /// already known) and then kept for the lifetime of the process.
     pub fn path(&self, session: &str) -> PathBuf {
+        if let Ok(map) = self.paths.lock() {
+            if let Some(existing) = map.get(session) {
+                return existing.clone();
+            }
+        }
         let title = self
             .titles
             .lock()
             .ok()
             .and_then(|map| map.get(session).cloned())
             .unwrap_or_else(|| "untitled".to_owned());
-        let id = sanitize(session);
-        self.dir.join(format!("ss-{}-{}-{}.jsonl", today(), id, title))
+        let path = self
+            .dir
+            .join(format!("ss-{}-{}-{}.jsonl", today(), sanitize(session), title));
+        if let Ok(mut map) = self.paths.lock() {
+            if map.len() >= MAX_TITLES && !map.contains_key(session) {
+                let keys: Vec<String> = map.keys().take(MAX_TITLES / 2).cloned().collect();
+                for key in keys {
+                    map.remove(&key);
+                }
+            }
+            map.entry(session.to_owned()).or_insert(path.clone());
+        }
+        path
     }
 }
 
@@ -96,26 +130,8 @@ fn slugify(title: &str) -> String {
 
 /// UTC date as `YYYY-MM-DD`.
 fn today() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    let (year, month, day) = timeutil::civil_from_days((timeutil::now_ms() / 1000 / 86_400) as i64);
     format!("{year:04}-{month:02}-{day:02}")
-}
-
-/// Howard Hinnant's `civil_from_days`: days since the Unix epoch -> (year, month, day).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 #[cfg(test)]
@@ -125,8 +141,8 @@ mod tests {
 
     #[test]
     fn date_conversion_matches_known_days() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(20_000), (2024, 10, 4));
+        assert_eq!(timeutil::civil_from_days(0), (1970, 1, 1));
+        assert_eq!(timeutil::civil_from_days(20_000), (2024, 10, 4));
     }
 
     #[test]

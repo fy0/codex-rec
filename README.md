@@ -89,3 +89,17 @@ CI builds and attaches two artifacts per release:
 * [docs/fingerprint.md](docs/fingerprint.md) — what the real codex client looks like on the wire
   (TLS, HTTP headers, request bodies), measured; plus why a widely circulated fingerprint card is wrong.
 * [docs/config.md](docs/config.md) — full configuration reference.
+
+## v0.4.0
+
+* **One directory per codex session** — `<log_dir>/<session-uuid>/<YYMMDD-HHMMSS>-<user|system>-rNNNN.<req|resp>.<role>`,
+  so recordings line up with the session-capture files and the thread source (user vs system
+  TITLE/RECAP turns) is visible at a glance. Empty artifacts are no longer created.
+* **Streaming summaries** — response SSE frames are parsed as they arrive, so no full-response buffer
+  is needed; non-SSE bodies are summarized by etag + sha256 (the `/models` payload is skipped by default).
+* **`[record]` switches** — every artifact individually, plus `enabled = false` for a pure forwarder,
+  and retention (`retention_days`, `gzip_after_days`, `max_total_bytes`).
+* **`[limits]`** — configurable request-body cap with spill/reject/stream behaviour, summary buffer
+  cap and file write-buffer size.
+* **`set_from_env`** — keep swapped credentials out of the TOML file.
+* Session-capture events now carry `body_file` / `summary_file` / `response_file` pointers.

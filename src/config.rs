@@ -7,8 +7,9 @@
 //!   * `""` is only meaningful for `terminal` (it removes the terminal segment); an empty
 //!     `originator` / `codex_version` / `os` / `arch` / `user_agent` is a config error.
 //!
-//! Header drop lists accept simple glob patterns (`cf-*`, `x-forwarded-*`), matched with the
-//! `globset` crate, compiled once at startup.
+//! `[record]` decides what is written at all (every artifact has its own switch, and
+//! `enabled = false` turns the recorder into a pure forwarder), `[limits]` bounds memory, and
+//! header drop lists accept glob patterns (`cf-*`) matched with the `globset` crate.
 //!
 //! Precedence: built-in defaults < TOML file < CLI flags.
 
@@ -121,8 +122,12 @@ pub struct HeaderRules {
     /// Glob patterns (e.g. `cf-*`); matched case-insensitively against header names.
     #[serde(default)]
     pub drop: Vec<String>,
+    /// Literal values; a value of the form `env:NAME` is read from the environment instead.
     #[serde(default)]
     pub set: BTreeMap<String, String>,
+    /// `header = "ENV_VAR"` pairs: read the value from the environment (keeps secrets out of the file).
+    #[serde(default)]
+    pub set_from_env: BTreeMap<String, String>,
 }
 
 impl HeaderRules {
@@ -139,6 +144,34 @@ impl HeaderRules {
             .build()
             .map(|set| Some(Arc::new(set)))
             .map_err(|e| format!("cannot compile header globs: {e}"))
+    }
+
+    /// Resolves `set` + `set_from_env` into concrete `(name, value)` pairs.
+    fn resolved(&self, section: &str, warnings: &mut Vec<String>) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (name, raw) in self.set.iter() {
+            let name = name.to_ascii_lowercase();
+            if let Some(var) = raw.strip_prefix("env:") {
+                match env::var(var) {
+                    Ok(value) => out.push((name, value)),
+                    Err(_) => warnings.push(format!(
+                        "[headers.{section}] {name} = \"env:{var}\" skipped: {var} is not set"
+                    )),
+                }
+            } else {
+                out.push((name, raw.clone()));
+            }
+        }
+        for (name, var) in self.set_from_env.iter() {
+            let name = name.to_ascii_lowercase();
+            match env::var(var) {
+                Ok(value) => out.push((name, value)),
+                Err(_) => warnings.push(format!(
+                    "[headers.{section}] {name} from env {var} skipped: {var} is not set"
+                )),
+            }
+        }
+        out
     }
 }
 
@@ -245,6 +278,135 @@ pub struct TlsSection {
     pub extension_order: Option<String>,
 }
 
+/// What to write, and for how long.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordSection {
+    /// Master switch. `false` = pure forwarder: nothing is written at all (rewrites still apply).
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default = "yes")]
+    pub index: bool,
+    #[serde(default = "yes")]
+    pub request_headers: bool,
+    #[serde(default = "yes")]
+    pub request_headers_out: bool,
+    #[serde(default = "yes")]
+    pub request_body_raw: bool,
+    #[serde(default = "yes")]
+    pub request_body_json: bool,
+    /// Store the rewritten request body when `--drop-body-key` / `--set-body-key` changed it.
+    #[serde(default = "yes")]
+    pub request_body_out: bool,
+    #[serde(default = "yes")]
+    pub request_summary: bool,
+    #[serde(default = "yes")]
+    pub response_headers: bool,
+    #[serde(default = "yes")]
+    pub response_stream: bool,
+    /// Keep the full `/models` catalog in the stream file (off: only its etag + hash are recorded).
+    #[serde(default = "no")]
+    pub response_stream_catalog: bool,
+    #[serde(default = "yes")]
+    pub response_summary: bool,
+    /// Delete recorded files older than this many days.
+    #[serde(default)]
+    pub retention_days: Option<u64>,
+    /// Gzip recorded files older than this many days.
+    #[serde(default)]
+    pub gzip_after_days: Option<u64>,
+    /// Delete the oldest recorded files until the tree fits into this many bytes.
+    #[serde(default)]
+    pub max_total_bytes: Option<u64>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn no() -> bool {
+    false
+}
+
+impl Default for RecordSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            index: true,
+            request_headers: true,
+            request_headers_out: true,
+            request_body_raw: true,
+            request_body_json: true,
+            request_body_out: true,
+            request_summary: true,
+            response_headers: true,
+            response_stream: true,
+            response_stream_catalog: false,
+            response_summary: true,
+            retention_days: None,
+            gzip_after_days: None,
+            max_total_bytes: None,
+        }
+    }
+}
+
+/// Memory bounds.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSection {
+    /// In-memory cap for a request body; above it `request_body_over_limit` decides what happens.
+    #[serde(default = "default_request_body_bytes")]
+    pub request_body_bytes: usize,
+    /// `spill` (default) writes the body to a file and forwards from there, `reject` answers 413,
+    /// `stream` forwards without buffering (recording of the body is then limited to a prefix).
+    #[serde(default = "default_over_limit")]
+    pub request_body_over_limit: String,
+    /// In-memory copy kept for the response summary when the body is not SSE (0 = keep nothing).
+    #[serde(default = "default_summary_bytes")]
+    pub summary_buffer_bytes: usize,
+    /// Write buffer for recorded files (0 = write every chunk straight through).
+    #[serde(default = "default_write_bytes")]
+    pub write_buffer_bytes: usize,
+}
+
+fn default_request_body_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+fn default_over_limit() -> String {
+    "spill".to_owned()
+}
+
+fn default_summary_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+fn default_write_bytes() -> usize {
+    256 * 1024
+}
+
+impl Default for LimitsSection {
+    fn default() -> Self {
+        Self {
+            request_body_bytes: default_request_body_bytes(),
+            request_body_over_limit: default_over_limit(),
+            summary_buffer_bytes: default_summary_bytes(),
+            write_buffer_bytes: default_write_bytes(),
+        }
+    }
+}
+
+impl LimitsSection {
+    fn validate(&self) -> Result<(), String> {
+        match self.request_body_over_limit.trim() {
+            "spill" | "reject" | "stream" => Ok(()),
+            other => Err(format!(
+                "limits.request_body_over_limit must be \"spill\", \"reject\" or \"stream\", got {other:?}"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -263,6 +425,10 @@ struct FileConfig {
     routes: RoutesSection,
     #[serde(default)]
     tls: TlsSection,
+    #[serde(default)]
+    record: RecordSection,
+    #[serde(default)]
+    limits: LimitsSection,
     /// `true` -> also write one JSONL file per session under `session_dir` (off by default).
     #[serde(default)]
     session_capture: bool,
@@ -277,12 +443,19 @@ pub struct Config {
     pub upstream: String,
     pub log_dir: PathBuf,
     pub persona: Option<Persona>,
+    #[allow(dead_code)]
     pub request_rules: HeaderRules,
+    #[allow(dead_code)]
     pub response_rules: HeaderRules,
+    /// `set` + `set_from_env`, already resolved (missing env vars produce warnings).
+    pub request_sets: Vec<(String, String)>,
+    pub response_sets: Vec<(String, String)>,
     pub request_drop_globs: Option<Arc<GlobSet>>,
     pub response_drop_globs: Option<Arc<GlobSet>>,
     pub routes: RoutesSection,
     pub extension_order: ExtensionOrder,
+    pub record: RecordSection,
+    pub limits: LimitsSection,
     pub body_drop: Vec<String>,
     pub body_set: Vec<(String, String)>,
     pub rewrite_catalog: bool,
@@ -359,6 +532,7 @@ pub fn load() -> Result<(Config, Vec<String>), String> {
             );
         }
     }
+    file.limits.validate()?;
 
     let list = |key: &str| -> Vec<String> {
         values
@@ -406,6 +580,8 @@ pub fn load() -> Result<(Config, Vec<String>), String> {
     }
     let request_drop_globs = request_rules.compile()?;
     let response_drop_globs = response_rules.compile()?;
+    let request_sets = request_rules.resolved("request", &mut warnings);
+    let response_sets = response_rules.resolved("response", &mut warnings);
 
     let session_capture = file.session_capture || flags.iter().any(|f| f == "session-capture");
     let session_dir = values
@@ -433,10 +609,14 @@ pub fn load() -> Result<(Config, Vec<String>), String> {
         persona: file.persona.clone(),
         request_rules,
         response_rules,
+        request_sets,
+        response_sets,
         request_drop_globs,
         response_drop_globs,
         routes: file.routes.clone(),
         extension_order,
+        record: file.record.clone(),
+        limits: file.limits.clone(),
         body_drop: values
             .get("drop-body-key")
             .map(|v| {
@@ -471,6 +651,12 @@ pub fn load() -> Result<(Config, Vec<String>), String> {
                 .to_owned(),
         );
     }
+    if !cfg.record.enabled {
+        warnings.push(
+            "[record] enabled = false: nothing is recorded (persona, header and path rewriting still apply)"
+                .to_owned(),
+        );
+    }
     Ok((cfg, warnings))
 }
 
@@ -497,7 +683,13 @@ mod tests {
 
     #[test]
     fn empty_values_are_rejected_where_they_make_no_sense() {
-        for bad in ["os = \"\"", "originator = \"\"", "arch = \"\"", "user_agent = \"\"", "codex_version = \"\""] {
+        for bad in [
+            "os = \"\"",
+            "originator = \"\"",
+            "arch = \"\"",
+            "user_agent = \"\"",
+            "codex_version = \"\"",
+        ] {
             let persona: Persona = toml::from_str(bad).unwrap();
             assert!(persona.validate().is_err(), "{bad} should be rejected");
         }
@@ -515,7 +707,10 @@ mod tests {
     #[test]
     fn route_mapping_defaults_to_the_codex_path() {
         let routes = RoutesSection::default();
-        assert_eq!(routes.upstream_path("/backend-api/codex/responses"), "/backend-api/codex/responses");
+        assert_eq!(
+            routes.upstream_path("/backend-api/codex/responses"),
+            "/backend-api/codex/responses"
+        );
         assert_eq!(routes.upstream_path("/v1/responses"), "/backend-api/codex/responses");
         assert_eq!(routes.upstream_path("/v1/models"), "/backend-api/codex/models");
         assert_eq!(routes.upstream_path("/api/v1/responses"), "/backend-api/codex/responses");
@@ -527,7 +722,7 @@ mod tests {
     #[test]
     fn route_mapping_can_be_reconfigured() {
         // An empty upstream prefix means "forward the stripped path as-is".
-        let routes: RoutesSection = toml::from_str(r#"upstream_prefix = """#).unwrap();
+        let routes: RoutesSection = toml::from_str("upstream_prefix = \"\"").unwrap();
         assert_eq!(routes.upstream_path("/v1/responses"), "/responses");
 
         let routes: RoutesSection = toml::from_str(
@@ -540,5 +735,58 @@ mod tests {
         assert_eq!(routes.upstream_path("/openai/v1/models"), "/backend-api/codex/models");
         assert_eq!(routes.upstream_path("/v1/models"), "/backend-api/codex/models");
         assert_eq!(routes.upstream_path("/other/models"), "/backend-api/codex/other/models");
+    }
+
+    #[test]
+    fn record_defaults_and_switch_parsing() {
+        let record = RecordSection::default();
+        assert!(record.enabled);
+        assert!(record.request_body_json);
+        assert!(!record.response_stream_catalog, "the catalog stream is off by default");
+        assert_eq!(record.retention_days, None);
+
+        let parsed: RecordSection = toml::from_str(
+            "enabled = false\nresponse_stream = false\nretention_days = 7\nmax_total_bytes = 1000",
+        )
+        .unwrap();
+        assert!(!parsed.enabled);
+        assert!(!parsed.response_stream);
+        assert_eq!(parsed.retention_days, Some(7));
+        assert_eq!(parsed.max_total_bytes, Some(1000));
+
+        let limits = LimitsSection::default();
+        assert_eq!(limits.request_body_bytes, 4 * 1024 * 1024);
+        assert_eq!(limits.request_body_over_limit, "spill");
+        assert!(limits.validate().is_ok());
+
+        let bad: LimitsSection = toml::from_str("request_body_over_limit = \"explode\"").unwrap();
+        assert!(bad.validate().is_err());
+
+        let tuned: LimitsSection =
+            toml::from_str("request_body_bytes = 0\nsummary_buffer_bytes = 0\nwrite_buffer_bytes = 0")
+                .unwrap();
+        assert_eq!(tuned.request_body_bytes, 0);
+        assert_eq!(tuned.summary_buffer_bytes, 0);
+    }
+
+    #[test]
+    fn header_sets_resolve_env_forms() {
+        std::env::set_var("CODEX_REC_TEST_TOKEN", "secret-value");
+        let rules: HeaderRules = toml::from_str(
+            r#"
+            set = { "x-fixed" = "plain", authorization = "env:CODEX_REC_TEST_TOKEN" }
+            set_from_env = { "chatgpt-account-id" = "CODEX_REC_TEST_ACCOUNT" }
+            "#,
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let resolved = rules.resolved("request", &mut warnings);
+        assert!(resolved.iter().any(|(k, v)| k == "x-fixed" && v == "plain"));
+        assert!(resolved
+            .iter()
+            .any(|(k, v)| k == "authorization" && v == "secret-value"));
+        assert!(!resolved.iter().any(|(k, _)| k == "chatgpt-account-id"));
+        assert_eq!(warnings.len(), 1);
+        std::env::remove_var("CODEX_REC_TEST_TOKEN");
     }
 }

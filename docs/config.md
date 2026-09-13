@@ -178,3 +178,77 @@ resp-<stamp>.summary.json every `model` value seen, service_tier echoes, respons
 
 Compare `req-*.hdr` with `req-*.out.hdr` to prove that a persona only touched the fields you
 configured.
+
+## `[record]` — what to write (v0.4.0)
+
+Every artifact has its own switch and they all default to `true` except the catalog stream:
+
+```toml
+[record]
+enabled = false            # master switch: false = pure forwarder, nothing is written at all
+                           # (persona, header rules and [routes] still apply)
+
+index = true               # index.jsonl
+request_headers = true     # <stem>.req.hdr        (incoming, secrets redacted)
+request_headers_out = true # <stem>.req.out.hdr    (what we actually sent)
+request_body_raw = true    # <stem>.req.body       (only when the client compressed the body)
+request_body_json = true   # <stem>.req.json       (decoded)
+request_body_out = true    # <stem>.req.out.json   (only when --drop/set-body-key rewrote it)
+request_summary = true     # <stem>.req.summary.json
+response_headers = true    # <stem>.resp.hdr       (with the decoded __oailb origin host)
+response_stream = true     # <stem>.resp.stream.sse|json|bin
+response_stream_catalog = false  # keep the whole /models payload (off: etag + sha256 only)
+response_summary = true    # <stem>.resp.summary.json
+
+# retention (the pruner runs at startup and then hourly)
+retention_days = 14        # delete files older than this
+gzip_after_days = 3        # gzip files older than this (`gzip -f`, skipped when missing)
+max_total_bytes = 5000000000  # delete the oldest files until the tree fits
+```
+
+Turning an artifact off also skips its work: no `zstd` decode when neither `request_body_json` nor
+`request_summary` is on, and the response body is passed straight through when `response_stream` and
+`response_summary` are both off.
+
+### Layout
+
+```text
+<log_dir>/<codex-session-uuid>/260912-231425-user-r0001.req.hdr
+                               260912-231425-user-r0001.req.json
+                               260912-231425-user-r0001.resp.stream.sse
+                               ...
+<log_dir>/_nosession/...       # requests without a session-id header
+```
+
+`user|system` is the turn's thread source (the TITLE/RECAP helpers run as system threads), `rNNNN` is
+the per-session request number and is shared by the matching response. Empty files are never created,
+and a decoded request body is only written when the request was compressed (otherwise it would be a
+copy of `req.json`). Session capture events carry `body_file` / `summary_file` / `response_file`
+pointers into this directory instead of duplicating the payload.
+
+## `[limits]` — memory bounds (v0.4.0)
+
+```toml
+[limits]
+request_body_bytes = 4194304       # 4 MiB in-memory cap for a request body
+request_body_over_limit = "spill"  # "spill" (default) | "reject" (413) | "stream",
+                                   # "stream" only applies when nothing needs the body
+summary_buffer_bytes = 4194304     # in-memory copy for non-SSE response summaries (0 = none)
+write_buffer_bytes = 262144        # BufWriter size for recorded files (0 = write straight through)
+```
+
+SSE responses are summarized *while they stream*, so they never need a full in-memory copy; the
+`summary_buffer_bytes` cap only applies to non-SSE bodies such as the `/models` catalog. A body that
+exceeds `request_body_bytes` is spilled to a file and forwarded from there — memory stays bounded and
+nothing is lost, but the decoded body/JSON/summary are skipped for that request (the index row marks
+`request_body_spilled = true`).
+
+## `set_from_env` — credentials outside the file (v0.4.0)
+
+```toml
+[headers.request]
+set = { "x-fixed" = "plain", authorization = "env:CODEX_TOKEN" }   # `env:NAME` is read from the env
+set_from_env = { "chatgpt-account-id" = "CODEX_ACCOUNT_ID" }        # explicit form
+```
+
+A missing environment variable produces a startup warning and the header is skipped.

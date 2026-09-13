@@ -1,6 +1,6 @@
 [package]
 name = "codex-rec"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 publish = false
 description = "Recording + forwarding proxy for the Codex backend, with a configurable device persona"
@@ -16,7 +16,7 @@ rustls-backend = ["reqwest/rustls-tls-native-roots", "dep:rustls", "dep:rustls-n
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "fs", "io-util"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["stream"] }
 native-tls = { version = "0.2", optional = true }
 rustls = { version = "0.23.36", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"], optional = true }

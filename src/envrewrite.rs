@@ -297,7 +297,10 @@ fn resolve_date(
     notes: &mut Notes,
 ) -> Option<String> {
     let spec = spec.trim();
-    let secs = now.unwrap_or_else(|| (crate::timeutil::now_ms() / 1000) as i64);
+    // Tests (or an operator debugging a zone) can pin the instant; otherwise use the wall clock.
+    let secs = now
+        .or_else(|| std::env::var("CODEX_REC_NOW_TS").ok().and_then(|v| v.trim().parse::<i64>().ok()))
+        .unwrap_or_else(|| (crate::timeutil::now_ms() / 1000) as i64);
     if spec.eq_ignore_ascii_case("auto") {
         let zone = zone?;
         let date = zone.date_at(secs);

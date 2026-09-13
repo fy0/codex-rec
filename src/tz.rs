@@ -66,6 +66,9 @@ impl Zone {
             Zone::Offset(seconds) => *seconds,
             Zone::Named(name) => {
                 if let Some(seconds) = tzfile_offset(name, utc_secs) {
+                    if std::env::var_os("CODEX_REC_TZ_DEBUG").is_some() {
+                        eprintln!("[timezone] {name} -> {:+03}:{:02} (tzdata)", seconds / 3600, (seconds.abs() % 3600) / 60);
+                    }
                     return seconds;
                 }
                 let fixed = fixed_offset(name);

@@ -31,10 +31,44 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Finds the `zstd` CLI: `$ZSTD` first, then a copy next to our own executable, then `PATH`.
+///
+/// The CLI is only needed to decode/encode compressed request bodies; on Windows it is frequently
+/// installed somewhere that is not on `PATH` (e.g. a conda environment), which used to make the
+/// environment rewrite silently skip compressed requests.
+fn zstd_program() -> std::ffi::OsString {
+    if let Some(path) = std::env::var_os("ZSTD") {
+        if std::path::Path::new(&path).is_file() {
+            return path;
+        }
+    }
+    let exe = if cfg!(windows) { "zstd.exe" } else { "zstd" };
+    if let Ok(own) = std::env::current_exe() {
+        if let Some(dir) = own.parent() {
+            let candidate = dir.join(exe);
+            if candidate.is_file() {
+                return candidate.into_os_string();
+            }
+        }
+    }
+    for dir in [
+        "C:/ProgramData/miniconda3/Library/bin",
+        "C:/ProgramData/miniconda3/Scripts",
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+    ] {
+        let candidate = std::path::Path::new(dir).join(exe);
+        if candidate.is_file() {
+            return candidate.into_os_string();
+        }
+    }
+    std::ffi::OsString::from(exe)
+}
+
 /// Runs the system `zstd` CLI (`mode` is `-d` or `-3`).
 pub fn zstd_cli(mode: &str, input: &[u8]) -> Option<Vec<u8>> {
     use std::io::Write;
-    let mut child = std::process::Command::new("zstd")
+    let mut child = std::process::Command::new(zstd_program())
         .arg(mode)
         .arg("-q")
         .arg("-c")

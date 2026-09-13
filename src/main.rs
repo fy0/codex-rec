@@ -510,7 +510,9 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                 }
                 _ => eprintln!("[body rewrite skipped] body is not a JSON object"),
             },
-            None => eprintln!("[body rewrite skipped] could not decode body"),
+            None => eprintln!(
+                "[body rewrite skipped] could not decode the body: set $ZSTD or put zstd(.exe) on PATH                  (the request was forwarded unchanged)"
+            ),
         }
     }
 
@@ -931,6 +933,15 @@ async fn main() {
         "routes: strip {:?} -> prefix {:?}",
         cfg.routes.strip_prefixes, cfg.routes.upstream_prefix
     );
+    let env = &cfg.rewrite.environment;
+    if env.is_active() {
+        println!(
+            "rewrite: environment timezone={:?} current_date={:?} cwd={:?} shell={:?} drop={:?} fill_missing={}",
+            env.timezone, env.current_date, env.cwd, env.shell, env.drop, env.fill_missing
+        );
+    } else {
+        println!("rewrite: no environment overrides (the client's values pass through)");
+    }
     if let Some(p) = cfg.config_path.as_ref() {
         println!("config file: {}", p.display());
     }

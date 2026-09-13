@@ -92,6 +92,16 @@ CI builds and attaches two artifacts per release:
 
 
 
+## v0.6.1
+
+* **Finding `zstd` no longer depends on `PATH`.** Decoding a compressed request body shells out to
+  the `zstd` CLI; if it was only installed somewhere off `PATH` (a conda environment on Windows, for
+  instance) the environment rewrite silently skipped that request and the client's own timezone went
+  upstream unchanged. It is now located via `$ZSTD`, then next to our own executable, then a few
+  well-known directories, and a failure is reported explicitly with that hint.
+* **The startup banner prints the rewrite configuration** (`rewrite: environment timezone=… …`), so
+  it is visible without waiting for a request.
+
 ## v0.6.0
 
 * **IANA timezones work on Windows.** A Windows host has no `/usr/share/zoneinfo`, so

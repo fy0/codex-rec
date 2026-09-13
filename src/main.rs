@@ -14,6 +14,7 @@ mod body;
 mod config;
 mod envrewrite;
 mod persona;
+mod probe;
 mod record;
 mod session;
 mod summary;
@@ -873,6 +874,12 @@ fn build_client(cfg: &Config) -> reqwest::Client {
 
 #[tokio::main]
 async fn main() {
+    // `probe` is a subcommand: it prints this machine's codex environment and a ready-to-paste
+    // config without starting the proxy (see src/probe.rs).
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("probe") {
+        std::process::exit(probe::run(&argv[1..]));
+    }
     let (cfg, warnings) = match config::load() {
         Ok(v) => v,
         Err(e) => {

@@ -1,6 +1,6 @@
 [package]
 name = "codex-rec"
-version = "0.5.7"
+version = "0.5.8"
 edition = "2021"
 publish = false
 description = "Recording + forwarding proxy for the Codex backend, with a configurable device persona"
@@ -28,6 +28,7 @@ toml = "0.8"
 globset = "0.4"
 bytes = "1"
 sha2 = "0.10"
+os_info = "3.12"
 futures-util = "0.3"
 
 # The Linux codex client bundles a static OpenSSL 3.5-class build; build our own so the

@@ -90,6 +90,13 @@ CI builds and attaches two artifacts per release:
   (TLS, HTTP headers, request bodies), measured; plus why a widely circulated fingerprint card is wrong.
 * [docs/config.md](docs/config.md) — full configuration reference.
 
+## v0.5.1
+
+* Fixed the TZif v2/v3 reader behind IANA zones in `[rewrite.environment].timezone`: the v2 block was
+  located with a hand-computed header length, so every IANA name silently fell back to a fixed
+  offset. The second `TZif` magic is now located directly, and a tzdata-backed test covers
+  `Asia/Taipei` (today: +08:00) and `America/Los_Angeles` (PDT/PST).
+
 ## v0.5.0
 
 * **`[rewrite.environment]`** — edit the `<environment_context>` block the client sends: `timezone`

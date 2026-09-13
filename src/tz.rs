@@ -136,19 +136,18 @@ fn tzfile_offset(name: &str, utc_secs: i64) -> Option<i32> {
     if bytes.len() < 44 || &bytes[0..4] != b"TZif" {
         return None;
     }
-    // v1 header block, then (for v2/v3) a second header + data block.
-    let version = bytes[4];
-    let block = if version == b'2' || version == b'3' {
-        let v1_len = tzif_block_len(&bytes, 0)?;
-        let off = v1_len;
-        if bytes.len() < off + 44 {
-            return None;
-        }
-        (off, true)
-    } else {
-        (0, false)
+    // A v2/v3 file holds a v1 block followed by a 64-bit block; find the second magic rather than
+    // computing the v1 length (the optional isstd/isut arrays make that easy to get wrong).
+    let base = match bytes[4] {
+        b'2' | b'3' => match bytes[1..].windows(4).position(|w| w == b"TZif") {
+            Some(rel) => rel + 1,
+            None => return None,
+        },
+        _ => 0,
     };
-    let (base, _) = block;
+    if bytes.len() < base + 44 {
+        return None;
+    }
     let (_isutcnt, _isstdcnt, _leapcnt, timecnt, typecnt, _charcnt) = tzif_counts(&bytes, base)?;
 
     // transition times are 8-byte in v2+ blocks, 4-byte in v1
@@ -202,9 +201,9 @@ fn tzif_counts(bytes: &[u8], base: usize) -> Option<(usize, usize, usize, usize,
 }
 
 fn tzif_block_len(bytes: &[u8], base: usize) -> Option<usize> {
-    let (_, _, leapcnt, timecnt, typecnt, charcnt) = tzif_counts(bytes, base)?;
+    let (isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt) = tzif_counts(bytes, base)?;
     // v1 layout: 44 + timecnt*4 + timecnt + typecnt*6 + charcnt + leapcnt*8 + isstdcnt + isutcnt
-    let total = 44 + timecnt * 5 + typecnt * 6 + charcnt + leapcnt * 8 + typecnt * 2;
+    let total = 44 + timecnt * 5 + typecnt * 6 + charcnt + leapcnt * 8 + isstdcnt + isutcnt;
     Some(total)
 }
 
@@ -325,6 +324,26 @@ mod tests {
         assert_eq!(&text[vs..ve], "+08:00");
         assert_eq!(&text[..end], "<a>1</a><timezone>+08:00</timezone>");
         assert!(element_span(text, "timezoneX").is_none());
+    }
+
+    /// Only meaningful where zoneinfo exists (CI and the landing box); on a bare Windows host the
+    /// documented fallback is used instead.
+    #[test]
+    fn tzdata_path_is_used_when_present() {
+        if tzdata_dir().is_none() {
+            eprintln!("no tzdata on this host; skipping");
+            return;
+        }
+        // Asia/Taipei has a 41-transition history (types +08:06 / +08:00 / +09:00 DST); the offset
+        // now must come out as exactly +08:00.
+        let taipei = Zone::Named("Asia/Taipei".to_owned());
+        assert_eq!(taipei.offset_at(1_789_254_600), 8 * 3600);
+        // a zone that observes DST must report the summer offset for a summer instant
+        let la = Zone::Named("America/Los_Angeles".to_owned());
+        let summer = 1_752_500_000i64; // 2025-07-15
+        let winter = 1_736_000_000i64; // 2024-12-31
+        assert_eq!(la.offset_at(summer), -7 * 3600, "summer should be PDT");
+        assert_eq!(la.offset_at(winter), -8 * 3600, "winter should be PST");
     }
 
     #[test]

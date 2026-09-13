@@ -1,6 +1,6 @@
 [package]
 name = "codex-rec"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 publish = false
 description = "Recording + forwarding proxy for the Codex backend, with a configurable device persona"

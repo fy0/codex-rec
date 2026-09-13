@@ -240,9 +240,13 @@ fill_missing  = false           # create elements the client did not send (defau
 ```
 
 * `timezone` accepts both forms a real client sends: a UTC offset (`+08:00`, `-05:30`, `UTC`) or an
-  IANA name (`Asia/Shanghai`, `Europe/Berlin`, `America/Los_Angeles`). IANA names are resolved
-  through the host's tzdata (`/usr/share/zoneinfo`, …) so **DST is applied**; if tzdata is missing the
-  recorder falls back to a fixed offset and says so in the log.
+  IANA name (`Asia/Taipei`, `Europe/Berlin`, `America/Los_Angeles`). IANA names are resolved through
+  the host's tzdata (`/usr/share/zoneinfo`, …) so **DST is applied**; if tzdata is missing the
+  recorder falls back to a fixed offset and says so in the log (`[timezone] no tzdata entry usable
+  for …`). v0.5.1 fixed the TZif v2/v3 parser, which previously always took that fallback.
+* `Asia/Taipei` is worth knowing about: its tzdata carries the historical +08:06 LMT and the 1937–1979
+  +09:00 summer time, but every offset used today resolves to **+08:00** — the same as the simpler
+  `"+08:00"` offset form.
 * `current_date = "auto"` is **converted**, not copied: the request is stamped in UTC, so a zone east
   or west of UTC can be a day ahead or behind (20:30Z on the 12th is already the 13th at `+08:00`).
 * `shift+Nd` / `shift-Nd` moves the converted date by whole days; a literal `YYYY-MM-DD` is used as-is.

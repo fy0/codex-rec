@@ -90,6 +90,16 @@ CI builds and attaches two artifacts per release:
   (TLS, HTTP headers, request bodies), measured; plus why a widely circulated fingerprint card is wrong.
 * [docs/config.md](docs/config.md) — full configuration reference.
 
+## v0.5.0
+
+* **`[rewrite.environment]`** — edit the `<environment_context>` block the client sends: `timezone`
+  (offset or IANA name, with DST via the system tzdata), `current_date` (`auto` converts the UTC
+  stamp into the configured zone, `shift±Nd`, or a literal date), `cwd`, `shell`, `workspace_roots`,
+  `drop`, and `fill_missing`. Absent keys change nothing; every edit is logged and recorded in
+  `index.jsonl` as `env_rewrite`, with the rewritten body saved as `.req.out.json`.
+* **`docs/configuration-guide.md`** — annotated guide to every key, including the full list of
+  terminal values `codex-rs/terminal-detection` can produce and what the persona does with them.
+
 ## v0.4.0
 
 * **One directory per codex session** — `<log_dir>/<session-uuid>/<YYMMDD-HHMMSS>-<user|system>-rNNNN.<req|resp>.<role>`,
@@ -103,3 +113,5 @@ CI builds and attaches two artifacts per release:
   cap and file write-buffer size.
 * **`set_from_env`** — keep swapped credentials out of the TOML file.
 * Session-capture events now carry `body_file` / `summary_file` / `response_file` pointers.
+
+See `docs/configuration-guide.md` for the annotated reference.

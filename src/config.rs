@@ -278,6 +278,16 @@ pub struct TlsSection {
     pub extension_order: Option<String>,
 }
 
+/// Content rewrites that are not header/identity related.
+///
+/// Every value is optional: a key that is absent changes nothing (the same rule the persona uses).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RewriteSection {
+    #[serde(default)]
+    pub environment: crate::envrewrite::EnvironmentSection,
+}
+
 /// What to write, and for how long.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -426,6 +436,8 @@ struct FileConfig {
     #[serde(default)]
     tls: TlsSection,
     #[serde(default)]
+    rewrite: RewriteSection,
+    #[serde(default)]
     record: RecordSection,
     #[serde(default)]
     limits: LimitsSection,
@@ -454,6 +466,7 @@ pub struct Config {
     pub response_drop_globs: Option<Arc<GlobSet>>,
     pub routes: RoutesSection,
     pub extension_order: ExtensionOrder,
+    pub rewrite: RewriteSection,
     pub record: RecordSection,
     pub limits: LimitsSection,
     pub body_drop: Vec<String>,
@@ -615,6 +628,7 @@ pub fn load() -> Result<(Config, Vec<String>), String> {
         response_drop_globs,
         routes: file.routes.clone(),
         extension_order,
+        rewrite: file.rewrite.clone(),
         record: file.record.clone(),
         limits: file.limits.clone(),
         body_drop: values
@@ -767,6 +781,30 @@ mod tests {
                 .unwrap();
         assert_eq!(tuned.request_body_bytes, 0);
         assert_eq!(tuned.summary_buffer_bytes, 0);
+    }
+
+    #[test]
+    fn rewrite_section_parses_and_defaults_to_inactive() {
+        let empty = RewriteSection::default();
+        assert!(!empty.environment.is_active());
+
+        let section: RewriteSection = toml::from_str(
+            r#"
+            [environment]
+            timezone = "+08:00"
+            current_date = "auto"
+            drop = ["subagents"]
+            "#,
+        )
+        .unwrap();
+        assert!(section.environment.is_active());
+        assert_eq!(section.environment.timezone.as_deref(), Some("+08:00"));
+        assert_eq!(section.environment.drop, vec!["subagents".to_owned()]);
+        assert!(!section.environment.fill_missing);
+
+        // unknown keys are rejected so typos do not silently do nothing
+        assert!(toml::from_str::<RewriteSection>("[environment]
+timezon = \"+08:00\"").is_err());
     }
 
     #[test]

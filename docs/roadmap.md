@@ -3,6 +3,9 @@
 Status legend: **DONE** · **AGREED** (decided, not implemented) · **OPEN** (needs a decision) · **DECLINED**
 
 > **All batches below landed in v0.4.0** (A1–A7, B1–B6, C1–C3, D1–D5 as far as they apply).
+> **v0.5.0** added `[rewrite.environment]` (timezone/date/cwd/shell/workspace_roots/drop/fill_missing)
+> and `docs/configuration-guide.md`; language injection was dropped because no language/locale field
+> exists anywhere in codex's context fragments or config schema.
 > What is left is only operations: deploying v0.4.0 on the landing box and the cleanup.
 
 ## Context

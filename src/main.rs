@@ -12,11 +12,13 @@
 
 mod body;
 mod config;
+mod envrewrite;
 mod persona;
 mod record;
 mod session;
 mod summary;
 mod timeutil;
+mod tz;
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -408,7 +410,8 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
     }
 
     // ---- request body: stream it through, or buffer/spill it
-    let rewrites_body = !cfg.body_drop.is_empty() || !cfg.body_set.is_empty();
+    let rewrites_env = cfg.rewrite.environment.is_active();
+    let rewrites_body = !cfg.body_drop.is_empty() || !cfg.body_set.is_empty() || rewrites_env;
     let want_body = rewrites_body || (record.enabled && app.recorder.needs_request_decode());
     let mut spilled: Option<std::path::PathBuf> = None;
     let mut body_bytes: Vec<u8> = Vec::new();
@@ -473,6 +476,7 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
     // ---- body decode / rewrite
     let mut body_out: Vec<u8> = body_bytes.clone();
     let mut rewritten = false;
+    let mut env_notes_detail: Vec<String> = Vec::new();
     if rewrites_body {
         match summary::decode_body(&body_bytes, cenc.as_deref()) {
             Some(decoded) => match serde_json::from_slice::<Value>(&decoded) {
@@ -485,6 +489,15 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                         let parsed =
                             serde_json::from_str::<Value>(raw).unwrap_or(Value::String(raw.clone()));
                         obj.insert(k.clone(), parsed);
+                    }
+                    if rewrites_env {
+                        let env_notes = envrewrite::apply_env(&cfg.rewrite.environment, &mut v, None);
+                        if env_notes.changed {
+                            env_notes_detail = env_notes.detail.clone();
+                            for line in env_notes.detail.iter() {
+                                println!("[rewrite] {line}");
+                            }
+                        }
                     }
                     let new = serde_json::to_vec(&v).unwrap_or_default();
                     body_out = if cenc.is_some() {
@@ -548,6 +561,7 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
             "persona": persona_notes,
             "request": request_summary,
             "request_file": request_json_file,
+            "env_rewrite": env_notes_detail,
             "request_body_bytes": body_total,
             "request_body_spilled": body_over_limit,
         })

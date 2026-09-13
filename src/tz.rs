@@ -200,6 +200,7 @@ fn tzif_counts(bytes: &[u8], base: usize) -> Option<(usize, usize, usize, usize,
     ))
 }
 
+#[allow(dead_code)] // kept for reference: the v2 block is now located by its TZif magic
 fn tzif_block_len(bytes: &[u8], base: usize) -> Option<usize> {
     let (isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt) = tzif_counts(bytes, base)?;
     // v1 layout: 44 + timecnt*4 + timecnt + typecnt*6 + charcnt + leapcnt*8 + isstdcnt + isutcnt

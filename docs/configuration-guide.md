@@ -292,3 +292,23 @@ response_stream_catalog = false
 [limits]
 request_body_bytes = 4194304
 ```
+
+---
+
+## 10. Generating a config for a machine: `codex-rec probe`
+
+```bash
+codex-rec probe                                  # report this machine + print a config for it
+codex-rec probe --cwd /root/code --shell bash     # with a pinned working directory / shell
+codex-rec probe --client-ua "<a user-agent>"      # adopt another machine's codex-native identity
+```
+
+The first block mirrors the real client's local probe: the User-Agent it would send, `originator`,
+`?client_version=`, the detected terminal (plus the raw `TERM` / `TERM_PROGRAM` / `TMUX` /
+`WT_SESSION` values behind that decision), shell, cwd, timezone, `current_date`, the
+`<environment_context>` block, and `codex --version` if the CLI is installed. The terminal order is
+the one documented in §2.
+
+The second block is that same machine expressed as configuration: anything already equal to the host
+is printed commented out (inherit), anything that differs is pinned — so on the machine it ran on,
+pasting the output changes nothing, while pasting it on a different machine reproduces this one.

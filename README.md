@@ -139,3 +139,30 @@ See `docs/configuration-guide.md` for the annotated reference.
 
 The annotated reference for every key (including the terminal values codex can produce) is
 `docs/configuration-guide.md`.
+
+## `codex-rec probe` — report (and reuse) a machine's codex environment
+
+`probe` is a subcommand; it does not start the proxy:
+
+```bash
+codex-rec probe                                        # this machine
+codex-rec probe --cwd /root/code --shell bash          # pretend a different cwd / shell
+codex-rec probe --client-ua "codex-tui/0.145.0 (Debian 12.0.0; x86_64) tmux/3.3a (codex-tui; 0.145.0)"
+```
+
+It prints three blocks:
+
+1. **codex's own local view** — the User-Agent the client builds, `originator`, `?client_version=`,
+   the detected terminal (with the raw probes that produced it), shell, cwd, timezone, `current_date`,
+   the `<environment_context>` block, and `codex --version` when the CLI is on PATH. Terminal
+   detection reproduces `codex-rs/terminal-detection` exactly (`TERM_PROGRAM` first, then
+   Ghostty/WezTerm/iTerm2/Apple_Terminal/kitty/Alacritty/Konsole/gnome-terminal/VTE/WindowsTerminal,
+   then `TERM`, with tmux/zellij tracked as multiplexers).
+2. **a `[persona]` + `[rewrite.environment]` config for this machine** — values that already match the
+   host are printed **commented out** (= inherit), values that differ are pinned. Pasting the section
+   into another machine's `codex-rec.toml` makes it look like this one.
+3. **the same data as JSON**, for scripting.
+
+Typical use: run `codex-rec probe` on the machine whose environment you want, copy the printed config
+into the target machine; or pass the printed User-Agent with `--client-ua` when probing a host you
+want to report on rather than copy.

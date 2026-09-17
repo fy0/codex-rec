@@ -26,22 +26,20 @@ jobs:
             target: x86_64-unknown-linux-musl
             artifact: codex-rec-x86_64-unknown-linux-musl
             features: native-tls-backend,rustls-backend
-          # arm64: the glibc build is the primary artifact. `gcc-aarch64-linux-gnu` is a complete
-          # cross toolchain from apt, and OpenSSL is vendored (so it is cross-compiled here too).
-          - os: ubuntu-24.04
+          # arm64: build natively on the ARM runner instead of cross-compiling. Cross OpenSSL
+          # builds need libc6-dev-arm64-cross, which --no-install-recommends skips; building on
+          # ubuntu-24.04-arm sidesteps the whole toolchain problem.
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: codex-rec-aarch64-unknown-linux-gnu
             features: native-tls-backend,rustls-backend
-            apt: gcc-aarch64-linux-gnu
-          # aarch64-musl would be nicer (one static file, no glibc floor), but Debian's
-          # `musl-tools` only ships an x86_64 musl-gcc. Using the gnu cross compiler with the musl
-          # target is not a real musl link, so this job is best-effort: it must never block the
-          # release, and glibc-*.txt records what actually came out.
-          - os: ubuntu-24.04
+          # aarch64-musl (one static file, no glibc floor). On the ARM runner Debian's musl-tools
+          # is a real aarch64 musl-gcc, so this is a genuine musl-static binary. Kept best-effort:
+          # it must never block the release, and glibc-*.txt records what actually came out.
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact: codex-rec-aarch64-unknown-linux-musl
             features: native-tls-backend,rustls-backend
-            apt: gcc-aarch64-linux-gnu
             experimental: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -56,19 +54,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake nasm musl-tools ${{ matrix.apt }}
 
-      # `musl-tools` is x86_64-only, so for aarch64-musl fetch a real musl cross toolchain.
-      # Without it the musl target would be linked with the gnu compiler, which is not a musl
-      # binary at all -- exactly the trap this step exists to avoid.
-      - name: Install aarch64 musl cross toolchain
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          set -euo pipefail
-          URL=https://musl.cc/aarch64-linux-musl-cross.tgz
-          curl -fsSL --retry 3 -o /tmp/musl-cross.tgz "$URL"
-          sudo tar -xzf /tmp/musl-cross.tgz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
-          /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc --version | head -1
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -81,13 +66,16 @@ jobs:
       - name: Build (release)
         shell: bash
         continue-on-error: ${{ matrix.experimental == true }}
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
         run: |
+          # Point cargo/cc at the right compiler per target. On the ARM runners the native
+          # `cc`/`musl-gcc` are already aarch64, so no cross prefix is needed.
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              export CC_x86_64_unknown_linux_musl=musl-gcc ;;
+            aarch64-unknown-linux-musl)
+              export CC_aarch64_unknown_linux_musl=musl-gcc
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc ;;
+          esac
           set +e
           cargo build --release --target ${{ matrix.target }} \
             --no-default-features --features ${{ matrix.features }} \

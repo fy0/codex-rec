@@ -169,17 +169,11 @@ impl HeaderRules {
         }
         for (name, path) in self.set_from_file.iter() {
             let name = name.to_ascii_lowercase();
-            match std::fs::read_to_string(path) {
-                Ok(text) => {
-                    let value = text.trim().to_owned();
-                    if value.is_empty() {
-                        warnings.push(format!(
-                            "[headers.{section}] {name} = \"{path}\" is empty; header left unset"
-                        ));
-                    } else {
-                        out.push((name, value));
-                    }
-                }
+            match read_header_value_file(Path::new(path)) {
+                Ok(Some(value)) => out.push((name, value)),
+                Ok(None) => warnings.push(format!(
+                    "[headers.{section}] {name} = \"{path}\" is empty; header left unset                      (write the value into it to switch it on)"
+                )),
                 Err(e) => warnings.push(format!(
                     "[headers.{section}] {name} = \"{path}\" skipped: {e}"
                 )),
@@ -196,6 +190,33 @@ impl HeaderRules {
         }
         out
     }
+}
+
+/// Reads a header value from a file: **one line**, no surrounding whitespace.
+///
+/// An empty file is `Ok(None)` -- the caller treats that as "do not send this header", which is the
+/// documented way to switch an injection off. Anything that cannot be a valid header value is an
+/// `Err`: silently dropping it would look exactly like "the header was not needed", and the caller
+/// needs to be able to say so. A stray newline is the case that matters in practice -- a value file
+/// written from a command's *stdout* rather than a single variable picks up whatever else that
+/// command printed.
+pub fn read_header_value_file(path: &Path) -> Result<Option<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let value = text.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.contains('\n') || value.contains('\r') {
+        return Err(format!(
+            "file holds {} lines, but a header value must be a single line; \
+             did it capture a command's output instead of just the value?",
+            text.lines().count()
+        ));
+    }
+    if let Err(e) = reqwest::header::HeaderValue::from_str(value) {
+        return Err(format!("not a valid header value: {e}"));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -918,5 +939,46 @@ timezon = \"+08:00\"").is_err());
         assert!(!resolved.iter().any(|(k, _)| k == "chatgpt-account-id"));
         assert_eq!(warnings.len(), 1);
         std::env::remove_var("CODEX_REC_TEST_TOKEN");
+    }
+}
+
+#[cfg(test)]
+mod header_value_file_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hvf-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("value.txt")
+    }
+
+    #[test]
+    fn a_single_value_is_returned() {
+        let p = tmp("single");
+        std::fs::write(&p, "abc-DEF_123\n").unwrap();
+        assert_eq!(read_header_value_file(&p).unwrap().as_deref(), Some("abc-DEF_123"));
+    }
+
+    #[test]
+    fn an_empty_file_means_send_nothing() {
+        let p = tmp("empty");
+        std::fs::write(&p, "   \n").unwrap();
+        assert_eq!(read_header_value_file(&p).unwrap(), None);
+    }
+
+    /// The failure this guards against: writing a command's *stdout* into the value file. That
+    /// looked exactly like "no header configured" before, so the stale value silently stayed in use.
+    #[test]
+    fn a_multi_line_file_is_an_error_not_a_silent_skip() {
+        let p = tmp("multi");
+        std::fs::write(&p, "  some banner text\nHEADER-VALUE\n").unwrap();
+        let err = read_header_value_file(&p).unwrap_err();
+        assert!(err.contains("single line"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error() {
+        let p = tmp("missing").with_extension("nope");
+        assert!(read_header_value_file(&p).is_err());
     }
 }

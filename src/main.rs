@@ -388,20 +388,27 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
     // `set_from_file` is re-read per request: that is what lets the turn-state be rotated while the
     // proxy keeps running (see the tsauto loop).
     let mut file_set_notes: Vec<(String, String)> = Vec::new();
+    let mut file_set_errors: Vec<String> = Vec::new();
     for (name, path) in cfg.request_sets_files.iter() {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                let value = text.trim();
+        match config::read_header_value_file(path) {
+            Ok(Some(value)) => {
                 if let (Ok(hn), Ok(hv)) = (
                     reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-                    reqwest::header::HeaderValue::from_str(value),
+                    reqwest::header::HeaderValue::from_str(&value),
                 ) {
                     out_headers.insert(hn, hv);
-                    file_set_notes.push((name.clone(), redact(name, value)));
+                    file_set_notes.push((name.clone(), redact(name, &value)));
                 }
             }
-            Err(_) => {}
+            // An empty file is the documented "send nothing" state: not an error, not a note.
+            Ok(None) => {}
+            // Anything else must be visible. A malformed value file used to look identical to
+            // "the file was not there", which hid a broken rotation for hours.
+            Err(e) => file_set_errors.push(format!("{name} from {}: {e}", path.display())),
         }
+    }
+    for e in file_set_errors.iter() {
+        eprintln!("[headers.request] set_from_file: {e}");
     }
     if let Some(plan) = plan.as_ref() {
         if record.request_headers_out {
@@ -414,6 +421,9 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
             }
             for (name, value) in file_set_notes.iter() {
                 out_lines.push(format!("{name}: {value}   <- set from file"));
+            }
+            for e in file_set_errors.iter() {
+                out_lines.push(format!("# set_from_file error: {e}"));
             }
             for (k, v) in out_headers.iter() {
                 let name = k.as_str().to_ascii_lowercase();

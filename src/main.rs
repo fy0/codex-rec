@@ -19,6 +19,8 @@ mod record;
 mod session;
 mod summary;
 mod timeutil;
+mod tsgrab;
+mod tsscan;
 mod tz;
 
 use std::fs::{self, File};
@@ -74,7 +76,7 @@ fn redact(name: &str, value: &str) -> String {
     value.to_owned()
 }
 
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 3 / 4 + 3);
     let mut buf = 0u32;
     let mut bits = 0u32;
@@ -99,7 +101,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Decodes the `__oailb` cookie that Cloudflare sets: it names the origin pool in use.
-fn decode_oailb(headers: &[String]) -> Option<String> {
+pub(crate) fn decode_oailb(headers: &[String]) -> Option<String> {
     for h in headers {
         let lower = h.to_ascii_lowercase();
         let Some(start) = lower.find("__oailb=") else { continue };
@@ -383,6 +385,24 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
             out_headers.insert(hn, hv);
         }
     }
+    // `set_from_file` is re-read per request: that is what lets the turn-state be rotated while the
+    // proxy keeps running (see the tsauto loop).
+    let mut file_set_notes: Vec<(String, String)> = Vec::new();
+    for (name, path) in cfg.request_sets_files.iter() {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let value = text.trim();
+                if let (Ok(hn), Ok(hv)) = (
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(value),
+                ) {
+                    out_headers.insert(hn, hv);
+                    file_set_notes.push((name.clone(), redact(name, value)));
+                }
+            }
+            Err(_) => {}
+        }
+    }
     if let Some(plan) = plan.as_ref() {
         if record.request_headers_out {
             let mut out_lines: Vec<String> = vec![format!("{method} {uri}"), format!("x-incoming-path: {in_path}")];
@@ -391,6 +411,9 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                     "{name}: {}   <- set by config",
                     redact(name, value)
                 ));
+            }
+            for (name, value) in file_set_notes.iter() {
+                out_lines.push(format!("{name}: {value}   <- set from file"));
             }
             for (k, v) in out_headers.iter() {
                 let name = k.as_str().to_ascii_lowercase();
@@ -679,6 +702,17 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                 resp_lines.push(format!("{name}: {value}   <- set by config"));
             }
         }
+        for (name, path) in cfg.response_sets_files.iter() {
+            let Ok(text) = std::fs::read_to_string(path) else { continue };
+            let value = text.trim();
+            if let (Ok(hn), Ok(hv)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                hs.insert(hn, hv);
+                resp_lines.push(format!("{name}: {value}   <- set from file"));
+            }
+        }
     }
     let origin = decode_oailb(&resp_lines);
     if let Some(o) = origin.as_ref() {
@@ -829,6 +863,40 @@ fn base_builder() -> reqwest::ClientBuilder {
         .pool_max_idle_per_host(2)
 }
 
+/// The HTTP client builder `tsgrab` uses: the *same* TLS stack and extension order as forwarding, so
+/// a grabbed request leaves the box with codex's own ClientHello.
+///
+/// Two things are specific to probing:
+///
+/// * `source` — binds the local socket, so an IPv6 prefix (or one v4 address of many) can be
+///   exercised without touching the host's routing table;
+/// * `proxy` — same surface as codex's own `HTTPS_PROXY`, including SOCKS5.
+pub(crate) fn tsgrab_http_builder(
+    timeout_secs: f64,
+    insecure: bool,
+    source: Option<std::net::IpAddr>,
+    proxy: Option<&str>,
+) -> reqwest::ClientBuilder {
+    let mut tls = native_tls::TlsConnector::builder();
+    if insecure {
+        tls.danger_accept_invalid_certs(true).danger_accept_invalid_hostnames(true);
+    }
+    let tls = tls.build().expect("failed to build native-tls connector");
+    let mut b = base_builder()
+        .use_preconfigured_tls(tls)
+        .timeout(Duration::from_secs_f64(timeout_secs.max(1.0)));
+    if let Some(ip) = source {
+        b = b.local_address(ip);
+    }
+    if let Some(p) = proxy.map(str::trim).filter(|p| !p.is_empty()) {
+        match reqwest::Proxy::all(p) {
+            Ok(px) => b = b.proxy(px),
+            Err(e) => eprintln!("warning: --proxy {p:?} rejected: {e}"),
+        }
+    }
+    b
+}
+
 /// native-tls / OpenSSL, no ALPN, HTTP/1.1: matches the measured codex ClientHello.
 #[cfg(feature = "native-tls-backend")]
 fn build_native_tls_client() -> reqwest::Client {
@@ -895,6 +963,17 @@ async fn main() {
     if argv.first().map(String::as_str) == Some("probe") {
         std::process::exit(probe::run(&argv[1..]));
     }
+    if argv.first().map(String::as_str) == Some("tsgrab") {
+        // already inside the tokio runtime that #[tokio::main] set up -- do NOT nest one
+        let code = match tsgrab::run(&argv[1..]).await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("tsgrab: {e}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
     let (cfg, warnings) = match config::load() {
         Ok(v) => v,
         Err(e) => {
@@ -954,6 +1033,12 @@ async fn main() {
         );
     } else {
         println!("rewrite: no environment overrides (the client's values pass through)");
+    }
+    if !cfg.request_sets_files.is_empty() {
+        println!(
+            "headers from file (re-read per request): {:?}",
+            cfg.request_sets_files
+        );
     }
     if let Some(p) = cfg.config_path.as_ref() {
         println!("config file: {}", p.display());

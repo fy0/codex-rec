@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -128,6 +128,10 @@ pub struct HeaderRules {
     /// `header = "ENV_VAR"` pairs: read the value from the environment (keeps secrets out of the file).
     #[serde(default)]
     pub set_from_env: BTreeMap<String, String>,
+    /// `header = "/path/to/file"` pairs: read the value from that file on **every request**, so a
+    /// long-running proxy can pick up a rotated token without being restarted.
+    #[serde(default)]
+    pub set_from_file: BTreeMap<String, String>,
 }
 
 impl HeaderRules {
@@ -146,7 +150,8 @@ impl HeaderRules {
             .map_err(|e| format!("cannot compile header globs: {e}"))
     }
 
-    /// Resolves `set` + `set_from_env` into concrete `(name, value)` pairs.
+    /// Resolves `set` + `set_from_env` into concrete `(name, value)` pairs. `set_from_file` is
+    /// deliberately NOT resolved here -- those are re-read per request (see `applied`).
     fn resolved(&self, section: &str, warnings: &mut Vec<String>) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         for (name, raw) in self.set.iter() {
@@ -160,6 +165,24 @@ impl HeaderRules {
                 }
             } else {
                 out.push((name, raw.clone()));
+            }
+        }
+        for (name, path) in self.set_from_file.iter() {
+            let name = name.to_ascii_lowercase();
+            match std::fs::read_to_string(path) {
+                Ok(text) => {
+                    let value = text.trim().to_owned();
+                    if value.is_empty() {
+                        warnings.push(format!(
+                            "[headers.{section}] {name} = \"{path}\" is empty; header left unset"
+                        ));
+                    } else {
+                        out.push((name, value));
+                    }
+                }
+                Err(e) => warnings.push(format!(
+                    "[headers.{section}] {name} = \"{path}\" skipped: {e}"
+                )),
             }
         }
         for (name, var) in self.set_from_env.iter() {
@@ -462,6 +485,10 @@ pub struct Config {
     /// `set` + `set_from_env`, already resolved (missing env vars produce warnings).
     pub request_sets: Vec<(String, String)>,
     pub response_sets: Vec<(String, String)>,
+    /// `set_from_file`: these are re-read from disk on every request, so a rotated token lands
+    /// without restarting the proxy.
+    pub request_sets_files: Vec<(String, PathBuf)>,
+    pub response_sets_files: Vec<(String, PathBuf)>,
     pub request_drop_globs: Option<Arc<GlobSet>>,
     pub response_drop_globs: Option<Arc<GlobSet>>,
     pub routes: RoutesSection,
@@ -475,6 +502,60 @@ pub struct Config {
     pub session_capture: bool,
     pub session_dir: PathBuf,
     pub config_path: Option<PathBuf>,
+}
+
+/// The path the config injects `x-codex-turn-state` from, if it uses `set_from_file`.
+///
+/// Used by the scanner so it can skip the token that is already installed.
+pub fn environment_token_file() -> Option<PathBuf> {
+    for c in ["codex-rec.toml", "/root/codex-rec.toml", "/etc/codex-rec.toml"] {
+        let p = PathBuf::from(c);
+        if !p.is_file() { continue; }
+        let Ok(text) = fs::read_to_string(&p) else { continue };
+        #[derive(serde::Deserialize)]
+        struct Partial { #[serde(default)] headers: HeaderSection }
+        if let Ok(partial) = toml::from_str::<Partial>(&text) {
+            if let Some((_, v)) = partial.headers.request.set_from_file.iter().next() {
+                return Some(PathBuf::from(v));
+            }
+        }
+    }
+    None
+}
+
+/// Reads **only** `[rewrite.environment]` from a config file.
+///
+/// `tsgrab` needs the environment rewrite but nothing else (listen port, persona, record switches),
+/// and it must not fail just because the file mentions options a newer/older binary does not know.
+/// Parsing into a permissive shape keeps the probe usable while the rest of the config evolves.
+pub fn load_environment_section(path: &Path) -> Result<crate::envrewrite::EnvironmentSection, String> {
+    #[derive(serde::Deserialize)]
+    struct Partial {
+        #[serde(default)]
+        rewrite: RewriteSection,
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("cannot read config: {e}"))?;
+    let partial: Partial = toml::from_str(&text)
+        .map_err(|e| format!("cannot parse config: {e}"))?;
+    Ok(partial.rewrite.environment)
+}
+
+/// The environment section when no `--config` was given: fall back to the usual locations, then to
+/// "no rewrite".
+pub fn default_environment_section() -> Option<crate::envrewrite::EnvironmentSection> {
+    let candidates = ["codex-rec.toml", "/etc/codex-rec.toml", "/root/codex-rec.toml"];
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.is_file() {
+            if let Ok(s) = load_environment_section(&p) {
+                if s.is_active() {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn cli_args() -> Vec<String> {
@@ -595,6 +676,15 @@ pub fn load() -> Result<(Config, Vec<String>), String> {
     let response_drop_globs = response_rules.compile()?;
     let request_sets = request_rules.resolved("request", &mut warnings);
     let response_sets = response_rules.resolved("response", &mut warnings);
+    let file_sets = |rules: &HeaderRules| -> Vec<(String, PathBuf)> {
+        rules
+            .set_from_file
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), PathBuf::from(v)))
+            .collect()
+    };
+    let request_sets_files = file_sets(&request_rules);
+    let response_sets_files = file_sets(&response_rules);
 
     let session_capture = file.session_capture || flags.iter().any(|f| f == "session-capture");
     let session_dir = values
@@ -624,6 +714,8 @@ pub fn load() -> Result<(Config, Vec<String>), String> {
         response_rules,
         request_sets,
         response_sets,
+        request_sets_files,
+        response_sets_files,
         request_drop_globs,
         response_drop_globs,
         routes: file.routes.clone(),

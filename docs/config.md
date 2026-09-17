@@ -38,6 +38,8 @@ rewrite_client_version = true      # also rewrite ?client_version= on /models
 [headers.request]
 drop = ["cf-*", "x-forwarded-*", "x-real-ip", "cdn-loop"]
 set  = { }
+# Re-read from disk on every request, so a rotated value lands without a restart (v0.7.0).
+# set_from_file = { "x-codex-turn-state" = "/root/codex-rec/ts_token.txt" }
 
 # [headers.request.set]
 # "x-openai-internal-codex-residency" = "us"
@@ -252,3 +254,35 @@ set_from_env = { "chatgpt-account-id" = "CODEX_ACCOUNT_ID" }        # explicit f
 ```
 
 A missing environment variable produces a startup warning and the header is skipped.
+
+## `set_from_file` — a header that outlives the process config (v0.7.0)
+
+```toml
+[headers.request]
+set_from_file = { "x-codex-turn-state" = "/root/codex-rec/ts_token.txt" }
+```
+
+`set` and `set_from_env` are **resolved once, at startup**. That is wrong for a value that rotates
+while the proxy runs — most importantly `x-codex-turn-state`, a per-turn routing token the backend
+issues in its response headers and only honours for a limited time (measured: ~30 min, refused well
+before 2 h).
+
+`set_from_file` names a file that is (re)read on **every request**:
+
+* the file must contain the header value alone; surrounding whitespace is stripped;
+* an **empty** file means "do not send this header" (a clean way to switch injection off);
+* a missing/unreadable file is skipped silently for requests, and reported once at startup;
+* the value that was actually sent appears in `*.req.out.hdr` as `<- set from file`, so every request
+  stays auditable.
+
+The rotation loop, end to end:
+
+```bash
+# 1. get a fresh token (one request; the connection is aborted after the headers, so it is not billed)
+TOK=$(codex-rec tsgrab --body-file /root/tsgrab/templates/probe.req.body                        --auth /root/.codex/auth.json --want-lengths 292 --quiet --attempts 12)
+# 2. install it atomically -- the running proxy uses it on the very next request
+printf '%s' "$TOK" > /root/codex-rec/ts_token.txt
+```
+
+`codex-rec tsgrab --scan-only` can often supply step 1 for free: see the README for the probe's
+flags, including `--interface` / `--source-ip` / `--proxy` for pinning egress.

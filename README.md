@@ -57,6 +57,60 @@ user-agent: codex-tui/0.145.0 (Debian 12.0.0; x86_64) xterm-256color (codex-tui;
 
 `req-*.hdr` and `req-*.out.hdr` (incoming vs. outgoing headers) make this auditable for every request.
 
+## Rotating the turn-state without a restart
+
+The `x-codex-turn-state` request header is a per-turn routing token the backend hands out in its
+**response** headers. It is time-bounded (measured: honoured for ~30 min, refused well before 2 h), so
+anything that keeps one installed has to refresh it.
+
+`[headers.request].set_from_file` reads a header value from a file **on every request**, so a
+long-running proxy picks up a rotation without being restarted:
+
+```toml
+[headers.request]
+set_from_file = { "x-codex-turn-state" = "/root/codex-rec/ts_token.txt" }
+```
+
+Together with the `tsgrab` subcommand below that is the whole loop: grab a fresh token, write it to
+the file, and the next request uses it.
+
+## `codex-rec tsgrab` — probe for a turn-state without paying for it
+
+The token arrives in the response **head**, before any output token exists. `tsgrab` therefore sends a
+real request, reads the header block, and **aborts the connection without reading the body** — the
+generation never completes, so nothing is billed (`x-codex-primary-used-percent` does not move).
+
+It reuses the same TLS client as forwarding, so a probe leaves with codex's own ClientHello, and it
+applies the configured `[rewrite.environment]` so the probe looks like a forwarded request rather than
+a verbatim replay of a stale recording.
+
+```bash
+# probe until a 292 shows up; print only the token so it composes with the shell
+TOK=$(codex-rec tsgrab --body-file probe.req.body --auth ~/.codex/auth.json \
+                       --want-lengths 292 --attempts 12 --quiet)
+
+# scan the recorder's own history first -- free, no request at all
+codex-rec tsgrab --body-file probe.req.body --want-lengths 292 --scan-only
+```
+
+| flag | meaning |
+|---|---|
+| `--body-file` | a captured `*.req.body` (its sibling `*.req.out.hdr` supplies the headers) |
+| `--want-lengths` | accepted base64 lengths, e.g. `292` or `288,292`; empty = any |
+| `--attempts`, `--gap-ms` | how many probes, and the pause between them |
+| `--auth` | an `auth.json` in codex's own shape; without it a **placeholder** bearer is sent, never the credentials found in a recording |
+| `--inject`, `--inject-from` | send this turn-state instead of the template's own |
+| `--interface`, `--source-ip`, `--prefer-family` | bind the egress address (one member of an IPv6 prefix, say) |
+| `--proxy` | `http://…`, `https://…` or `socks5://…` |
+| `--scan-only`, `--scan-fresh-within`, `--scan-max` | mine the recorder's history instead of probing |
+| `--out`, `--quiet` | metadata as JSON / print the token and nothing else |
+
+The scan walks the recorded `*.resp.hdr` files **newest first** and stops once it has enough usable
+candidates, so a scheduled scan costs a fraction of a second no matter how large the tree is.
+
+Nothing here is automatic: `tsgrab` is a one-shot tool, and whether to inject its output is a separate
+decision (`set_from_file` above).
+
 ## Features
 
 | | |
@@ -91,6 +145,24 @@ CI builds and attaches two artifacts per release:
 * [docs/config.md](docs/config.md) — full configuration reference.
 
 
+
+## v0.7.0
+
+Turn-state tooling, plus a way to rotate a header without restarting.
+
+* **`[headers.request].set_from_file` / `[headers.response].set_from_file`** — read a header value
+  from a file on **every request**. `set` / `set_from_env` are resolved once at startup; this one
+  exists because a long-running proxy may need to pick up a rotated value (a token with a limited
+  lifetime) without being restarted. Audited in `req.out.hdr` as `<- set from file`.
+* **`codex-rec tsgrab`** — probe the Codex backend for a fresh `x-codex-turn-state` by reading the
+  response head and then aborting, so the generation is never billed. Shares the forwarding client
+  (identical ClientHello) and applies `[rewrite.environment]`, so the probe carries the configured
+  timezone instead of the template's stale one. Egress can be pinned (`--interface`, `--source-ip`,
+  `--prefer-family`) and routed (`--proxy`, incl. SOCKS5); `--auth <auth.json>` supplies credentials.
+* **History scan** (`--scan-only`) — the recorder has been logging every response header all along,
+  so a fresh token can often be found without sending anything. Walks newest-file-first with an early
+  stop, so it stays cheap on a large tree.
+* `--quiet` prints only the token, so the probe composes with `$(…)`.
 
 ## v0.6.4
 

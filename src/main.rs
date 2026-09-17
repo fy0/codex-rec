@@ -413,33 +413,33 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
     if let Some(plan) = plan.as_ref() {
         if record.request_headers_out {
             let mut out_lines: Vec<String> = vec![format!("{method} {uri}"), format!("x-incoming-path: {in_path}")];
-            // Configured headers are reported as comments, and then the header itself is listed
-            // once from the real map below. They used to be printed as if they were headers *and*
-            // repeated as headers, so a grep for the name found two identical-looking lines and it
-            // was impossible to tell which value actually went out -- which is precisely the
-            // question this file exists to answer.
+            // Provenance, then the value that actually went out.
+            //
+            // Several sources can set the same header (`set`, then `set_from_file`, then
+            // `set_from_env`, each overwriting the previous), so listing only the sources leaves
+            // the one question this file exists to answer open: which value won. Listing only the
+            // headers loses where they came from. Emit the sources as comments and then the final
+            // header exactly once, marked, so both are readable and nothing is ambiguous.
+            let mut configured_names: Vec<String> = Vec::new();
             for (name, value) in cfg.request_sets.iter() {
-                out_lines.push(format!(
-                    "# set by config: {name}: {}",
-                    redact(name, value)
-                ));
+                configured_names.push(name.clone());
+                out_lines.push(format!("# from config: {name}: {}", redact(name, value)));
             }
             for (name, value) in file_set_notes.iter() {
-                out_lines.push(format!("# set from file: {name}: {value}"));
+                configured_names.push(name.clone());
+                out_lines.push(format!("# from file:   {name}: {value}"));
             }
             for e in file_set_errors.iter() {
                 out_lines.push(format!("# set_from_file error: {e}"));
             }
-            let configured = |name: &str| -> bool {
-                cfg.request_sets.iter().any(|(s, _)| s.eq_ignore_ascii_case(name))
-                    || cfg.request_sets_files.iter().any(|(s, _)| s.eq_ignore_ascii_case(name))
-            };
             for (k, v) in out_headers.iter() {
                 let name = k.as_str().to_ascii_lowercase();
-                if configured(&name) {
-                    continue; // already reported above, as a comment with its provenance
+                let value = redact(&name, v.to_str().unwrap_or("<non-utf8>"));
+                if configured_names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                    out_lines.push(format!("{name}: {value}   <- sent (last write wins)"));
+                } else {
+                    out_lines.push(format!("{name}: {value}"));
                 }
-                out_lines.push(format!("{name}: {}", redact(&name, v.to_str().unwrap_or("<non-utf8>"))));
             }
             for note in persona_notes.iter() {
                 out_lines.push(format!("# persona: {note}"));
@@ -1102,4 +1102,45 @@ async fn main() {
     let router = Router::new().fallback(any(handle)).with_state(Arc::clone(&app));
     let listener = tokio::net::TcpListener::bind(&listen).await.expect("bind failed");
     axum::serve(listener, router).await.expect("server error");
+}
+
+#[cfg(test)]
+mod header_audit_tests {
+    /// The audit line for a configured header must say that it was sent, and the provenance lines
+    /// must be comments. Regression: listing only the sources made it impossible to see which of
+    /// several same-named sources actually won; listing only the headers hid where they came from.
+    #[test]
+    fn configured_headers_are_marked_and_provenance_is_commented() {
+        let configured = ["x-codex-turn-state".to_owned()];
+        let final_value = "FROM-FILE";
+        let mut out_lines: Vec<String> = vec!["POST /x".to_owned()];
+        out_lines.push(format!("# from config: x-codex-turn-state: STALE"));
+        out_lines.push(format!("# from file:   x-codex-turn-state: {final_value}"));
+        let name = "x-codex-turn-state";
+        let value = final_value;
+        if configured.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            out_lines.push(format!("{name}: {value}   <- sent (last write wins)"));
+        } else {
+            out_lines.push(format!("{name}: {value}"));
+        }
+        let dump = out_lines.join("\n");
+
+        let header_lines: Vec<&str> = dump
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("x-codex-turn-state:"))
+            .collect();
+        assert_eq!(header_lines.len(), 1, "exactly one real header line: {dump}");
+        assert!(
+            header_lines[0].contains(final_value),
+            "the real line must carry the value that was actually sent: {dump}"
+        );
+        assert!(
+            dump.lines().any(|l| l.starts_with("# from config:")),
+            "provenance must be present as a comment: {dump}"
+        );
+        assert!(
+            dump.lines().any(|l| l.starts_with("# from file:")),
+            "file provenance must be present as a comment: {dump}"
+        );
+    }
 }

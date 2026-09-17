@@ -413,22 +413,31 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
     if let Some(plan) = plan.as_ref() {
         if record.request_headers_out {
             let mut out_lines: Vec<String> = vec![format!("{method} {uri}"), format!("x-incoming-path: {in_path}")];
+            // Configured headers are reported as comments, and then the header itself is listed
+            // once from the real map below. They used to be printed as if they were headers *and*
+            // repeated as headers, so a grep for the name found two identical-looking lines and it
+            // was impossible to tell which value actually went out -- which is precisely the
+            // question this file exists to answer.
             for (name, value) in cfg.request_sets.iter() {
                 out_lines.push(format!(
-                    "{name}: {}   <- set by config",
+                    "# set by config: {name}: {}",
                     redact(name, value)
                 ));
             }
             for (name, value) in file_set_notes.iter() {
-                out_lines.push(format!("{name}: {value}   <- set from file"));
+                out_lines.push(format!("# set from file: {name}: {value}"));
             }
             for e in file_set_errors.iter() {
                 out_lines.push(format!("# set_from_file error: {e}"));
             }
+            let configured = |name: &str| -> bool {
+                cfg.request_sets.iter().any(|(s, _)| s.eq_ignore_ascii_case(name))
+                    || cfg.request_sets_files.iter().any(|(s, _)| s.eq_ignore_ascii_case(name))
+            };
             for (k, v) in out_headers.iter() {
                 let name = k.as_str().to_ascii_lowercase();
-                if cfg.request_sets.iter().any(|(s, _)| s.eq_ignore_ascii_case(&name)) {
-                    continue;
+                if configured(&name) {
+                    continue; // already reported above, as a comment with its provenance
                 }
                 out_lines.push(format!("{name}: {}", redact(&name, v.to_str().unwrap_or("<non-utf8>"))));
             }

@@ -74,6 +74,10 @@ set_from_file = { "x-codex-turn-state" = "/root/codex-rec/ts_token.txt" }
 Together with the `tsgrab` subcommand below that is the whole loop: grab a fresh token, write it to
 the file, and the next request uses it.
 
+[`ops/`](ops/README.md) has the ready-made rotation loop (`tsroll.sh` + a systemd unit) and a
+one-command status tool (`fpstatus.sh`) for running this on a live box — all bash, so it can be
+changed without rebuilding.
+
 ## `codex-rec tsgrab` — probe for a turn-state without paying for it
 
 The token arrives in the response **head**, before any output token exists. `tsgrab` therefore sends a

@@ -1,0 +1,23 @@
+[Unit]
+Description=tsroll - keep a fresh x-codex-turn-state injected into codex-rec
+Documentation=file:///root/tsgrab/tsroll.sh
+# Needs the proxy to be up, but must not be stopped by it: if codex-rec restarts, tsroll's
+# rotation is still valid (the token file is re-read per request), so this is Wants, not Requires.
+After=network-online.target codex-rec.service
+Wants=network-online.target
+
+[Service]
+Type=forking
+# `tsroll.sh start` daemonises the loop with setsid and writes its pid here.
+PIDFile=/root/tsgrab/state/roll.pid
+ExecStart=/root/tsgrab/tsroll.sh start --refresh-after 35 --retry 90 --budget 60 --idle 1200
+ExecStop=/root/tsgrab/tsroll.sh stop
+Restart=always
+RestartSec=15
+# The loop is a plain bash script that reads a file and occasionally runs one tsgrab; nothing
+# privileged is needed.
+StandardOutput=append:/root/tsgrab/state/service.log
+StandardError=append:/root/tsgrab/state/service.log
+
+[Install]
+WantedBy=multi-user.target

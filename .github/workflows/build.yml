@@ -26,6 +26,23 @@ jobs:
             target: x86_64-unknown-linux-musl
             artifact: codex-rec-x86_64-unknown-linux-musl
             features: native-tls-backend,rustls-backend
+          # arm64: the glibc build is the primary artifact. `gcc-aarch64-linux-gnu` is a complete
+          # cross toolchain from apt, and OpenSSL is vendored (so it is cross-compiled here too).
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            artifact: codex-rec-aarch64-unknown-linux-gnu
+            features: native-tls-backend,rustls-backend
+            apt: gcc-aarch64-linux-gnu
+          # aarch64-musl would be nicer (one static file, no glibc floor), but Debian's
+          # `musl-tools` only ships an x86_64 musl-gcc. Using the gnu cross compiler with the musl
+          # target is not a real musl link, so this job is best-effort: it must never block the
+          # release, and glibc-*.txt records what actually came out.
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+            artifact: codex-rec-aarch64-unknown-linux-musl
+            features: native-tls-backend,rustls-backend
+            apt: gcc-aarch64-linux-gnu
+            experimental: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: codex-rec-x86_64-pc-windows-msvc
@@ -37,7 +54,20 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake nasm musl-tools
+          sudo apt-get install -y --no-install-recommends cmake nasm musl-tools ${{ matrix.apt }}
+
+      # `musl-tools` is x86_64-only, so for aarch64-musl fetch a real musl cross toolchain.
+      # Without it the musl target would be linked with the gnu compiler, which is not a musl
+      # binary at all -- exactly the trap this step exists to avoid.
+      - name: Install aarch64 musl cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          URL=https://musl.cc/aarch64-linux-musl-cross.tgz
+          curl -fsSL --retry 3 -o /tmp/musl-cross.tgz "$URL"
+          sudo tar -xzf /tmp/musl-cross.tgz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc --version | head -1
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -50,8 +80,13 @@ jobs:
 
       - name: Build (release)
         shell: bash
+        continue-on-error: ${{ matrix.experimental == true }}
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
         run: |
           set +e
           cargo build --release --target ${{ matrix.target }} \
@@ -63,6 +98,7 @@ jobs:
 
       - name: Test (persona + config unit tests)
         shell: bash
+        continue-on-error: ${{ matrix.experimental == true }}
         run: |
           set +e
           cargo test --release --target ${{ matrix.target }} \
@@ -75,6 +111,15 @@ jobs:
           ls -la "$BIN" || true
           file "$BIN" || true
           ldd "$BIN" || true
+          if [ -f "$BIN" ]; then
+            # An aarch64-musl binary that still needs a dynamic loader is not really musl-static;
+            # record what it is so the release notes can be honest about it.
+            if readelf -l "$BIN" 2>/dev/null | grep -q INTERP; then
+              echo "dynamic_interpreter=yes"
+            else
+              echo "dynamic_interpreter=no"
+            fi
+          fi
           if [ -f "$BIN" ]; then
             MAX=$(grep -ao 'GLIBC_2\.[0-9]*' "$BIN" | sort -Vu | tail -1)
             echo "max_glibc=${MAX:-none}" | tee glibc-${{ matrix.target }}.txt
@@ -101,7 +146,7 @@ jobs:
           if-no-files-found: warn
 
       - uses: actions/upload-artifact@v4
-        if: success()
+        if: success() || matrix.experimental
         with:
           name: ${{ matrix.artifact }}
           path: |

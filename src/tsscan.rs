@@ -376,3 +376,100 @@ x-codex-safety-buffering-enabled: true
         assert!(!matches_want(&hit, &["292".to_owned()]));
     }
 }
+
+#[cfg(test)]
+mod usability_tests {
+    use super::*;
+
+    /// A token whose issue time is `age` seconds in the past, with `raw_len` bytes total.
+    fn token_aged(age: u64, raw_len: usize) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let issued = now.saturating_sub(age);
+        let mut raw = vec![0x80u8];
+        raw.extend_from_slice(&issued.to_be_bytes());
+        while raw.len() < raw_len {
+            raw.push(0x11);
+        }
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in raw.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(A[(n >> 18) as usize & 63] as char);
+            out.push(A[(n >> 12) as usize & 63] as char);
+            if chunk.len() > 1 { out.push(A[(n >> 6) as usize & 63] as char); }
+            if chunk.len() > 2 { out.push(A[n as usize & 63] as char); }
+        }
+        out
+    }
+
+    fn scan_of(dir: &Path, fresh_within: u64) -> ScanResult {
+        scan(&ScanArgs {
+            want: vec![],
+            dirs: vec![dir.to_path_buf()],
+            max_depth: 3,
+            fresh_within,
+            skip: None,
+            max_candidates: 1,
+        })
+    }
+
+    /// The bug that made a rotation loop re-install an expired token every 30 s: `best` must be
+    /// empty when nothing is fresh, and `newest` must still be reported for diagnostics.
+    #[test]
+    fn a_stale_token_is_not_usable_but_is_still_reported() {
+        let dir = std::env::temp_dir().join(format!("tsscan-fresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = token_aged(4000, 233); // ~66 min old
+        std::fs::write(
+            dir.join("s.resp.hdr"),
+            format!("HTTP 200\nx-codex-turn-state: {stale}\n"),
+        )
+        .unwrap();
+
+        let r = scan_of(&dir, 1800);
+        assert!(r.best.is_none(), "a 66-minute-old token must not be usable");
+        assert!(r.newest.is_some(), "it must still be reported as the newest");
+
+        let r2 = scan_of(&dir, 7200);
+        assert!(r2.best.is_some(), "with a wide enough window it becomes usable");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_fresh_token_is_usable() {
+        let dir = std::env::temp_dir().join(format!("tsscan-fresh2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = token_aged(5, 233);
+        std::fs::write(
+            dir.join("f.resp.hdr"),
+            format!("HTTP 200\nx-codex-turn-state: {fresh}\n"),
+        )
+        .unwrap();
+        let r = scan_of(&dir, 1800);
+        assert!(r.best.is_some());
+        assert!(r.best.unwrap().age_secs(
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        ) < 60);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--scan-fresh-within 0` must mean "only something issued right now", not "anything goes".
+    #[test]
+    fn a_zero_window_is_not_a_wildcard() {
+        let dir = std::env::temp_dir().join(format!("tsscan-fresh3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = token_aged(600, 233);
+        std::fs::write(
+            dir.join("o.resp.hdr"),
+            format!("HTTP 200\nx-codex-turn-state: {old}\n"),
+        )
+        .unwrap();
+        let r = scan_of(&dir, 0);
+        assert!(r.best.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

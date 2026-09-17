@@ -852,7 +852,12 @@ pub async fn run(argv: &[String]) -> Result<(), String> {
 
     if args.scan_only {
         // `--quiet` must print the token and nothing else, so the shell can capture it.
-        if let Some(h) = found.best.as_ref().or(found.newest.as_ref()) {
+        //
+        // Only a *usable* hit counts, and in quiet mode a miss must print NOTHING. Reporting the
+        // newest-but-too-old token here would look identical to success to a caller doing
+        // `tok=$(... --scan-only --quiet)`, which is how a rotation loop ends up re-installing an
+        // already-expired token forever.
+        if let Some(h) = found.best.as_ref() {
             if args.quiet {
                 println!("{}", h.token);
             } else {
@@ -866,7 +871,15 @@ pub async fn run(argv: &[String]) -> Result<(), String> {
         }
         if !args.quiet {
             println!();
-            println!("no turn-state found in the scanned history");
+            match found.newest.as_ref() {
+                Some(h) => println!(
+                    "nothing usable: the newest token is {}s old (limit {}s), from {}",
+                    h.age_secs(now_unix()),
+                    args.scan_fresh_within,
+                    h.source.display()
+                ),
+                None => println!("no turn-state found in the scanned history"),
+            }
         }
         return Err("nothing usable in the scan history".to_owned());
     }

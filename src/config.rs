@@ -167,18 +167,12 @@ impl HeaderRules {
                 out.push((name, raw.clone()));
             }
         }
-        for (name, path) in self.set_from_file.iter() {
-            let name = name.to_ascii_lowercase();
-            match read_header_value_file(Path::new(path)) {
-                Ok(Some(value)) => out.push((name, value)),
-                Ok(None) => warnings.push(format!(
-                    "[headers.{section}] {name} = \"{path}\" is empty; header left unset                      (write the value into it to switch it on)"
-                )),
-                Err(e) => warnings.push(format!(
-                    "[headers.{section}] {name} = \"{path}\" skipped: {e}"
-                )),
-            }
-        }
+        // `set_from_file` is intentionally absent here: those are read per request (see
+        // `Config::request_sets_files`). Resolving them at startup as well would freeze the value
+        // that existed when the process started and then race the per-request read -- the outgoing
+        // header would be whichever `insert` ran last, and `req.out.hdr` would list the header
+        // twice. That is exactly how a rotation looked like it was working while the stale value
+        // was the one being sent.
         for (name, var) in self.set_from_env.iter() {
             let name = name.to_ascii_lowercase();
             match env::var(var) {
@@ -980,5 +974,52 @@ mod header_value_file_tests {
     fn a_missing_file_is_an_error() {
         let p = tmp("missing").with_extension("nope");
         assert!(read_header_value_file(&p).is_err());
+    }
+}
+
+#[cfg(test)]
+mod set_from_file_is_per_request_tests {
+    use super::*;
+
+    /// `set_from_file` must NOT appear in the startup-resolved list. It used to, which froze the
+    /// value present at startup and made the outgoing header depend on insert order -- while the
+    /// per-request read (the whole point of the option) was also happening.
+    #[test]
+    fn resolved_never_contains_set_from_file_entries() {
+        let mut rules = HeaderRules::default();
+        rules.set.insert("x-static".to_owned(), "fixed".to_owned());
+        rules
+            .set_from_env
+            .insert("x-from-env".to_owned(), "SOME_UNSET_VAR_XYZ".to_owned());
+        rules
+            .set_from_file
+            .insert("x-codex-turn-state".to_owned(), "/tmp/whatever".to_owned());
+
+        let mut warnings = Vec::new();
+        let resolved = rules.resolved("request", &mut warnings);
+
+        let names: Vec<&str> = resolved.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"x-static"), "set entries still resolve: {names:?}");
+        assert!(
+            !names.contains(&"x-codex-turn-state"),
+            "set_from_file must not be resolved at startup: {names:?}"
+        );
+    }
+
+    /// The file set must survive into the config so the per-request path can find it.
+    #[test]
+    fn file_sets_are_collected_separately() {
+        let mut rules = HeaderRules::default();
+        rules
+            .set_from_file
+            .insert("X-Codex-Turn-State".to_owned(), "/root/tok".to_owned());
+        let pairs: Vec<(String, PathBuf)> = rules
+            .set_from_file
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), PathBuf::from(v)))
+            .collect();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "x-codex-turn-state");
+        assert_eq!(pairs[0].1, PathBuf::from("/root/tok"));
     }
 }

@@ -1,0 +1,19 @@
+[Unit]
+Description=tsroll - hunt a fresh x-codex-turn-state and mirror it to the override API
+Documentation=file:///root/tsgrab/tsroll.py
+# Deployment for the ARM/IPv6 box: no local proxy, the token is only installed and
+# mirrored. Each probe leaves from a random address of the /64, so the cadence can
+# safely be double the default (15 s + 0..5 s jitter).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/tsgrab/tsroll.py --refresh-after 35 --retry 15 --retry-jitter 5 --budget 40 --idle 1800 --v6-subnet 2a0a:4cc0:101:b12::/64
+Restart=always
+RestartSec=15
+StandardOutput=append:/root/tsgrab/state/service.log
+StandardError=append:/root/tsgrab/state/service.log
+
+[Install]
+WantedBy=multi-user.target

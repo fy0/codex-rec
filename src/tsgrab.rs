@@ -356,7 +356,14 @@ fn headers_from_template(body: &Path, inject: Option<&str>) -> Vec<(String, Stri
         }
         let Some((name, value)) = line.split_once(':') else { continue };
         let name = name.trim().to_ascii_lowercase();
-        let value = value.trim().to_owned();
+        let value = value.trim();
+        // The recorder marks configured headers as `... <- sent (last write wins)` (response
+        // dumps use ` <- set by config` / ` <- set from file`). That provenance is for humans;
+        // the wire value ends at the marker.
+        let value = match value.find(" <-") {
+            Some(i) => value[..i].trim_end(),
+            None => value,
+        };
         if value.is_empty() {
             continue;
         }
@@ -365,7 +372,7 @@ fn headers_from_template(body: &Path, inject: Option<&str>) -> Vec<(String, Stri
             "x-codex-turn-state" if inject.is_some() => continue,
             _ => {}
         }
-        out.push((name, value));
+        out.push((name, value.to_owned()));
     }
     out
 }
@@ -1100,6 +1107,47 @@ fn format_age(issued: u64) -> String {
 async fn sleep(ms: u64) {
     if ms > 0 {
         tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The recorder annotates configured headers in `.req.out.hdr` (`... <- sent (last write
+    /// wins)`); that provenance is a comment for humans and must never leak into the headers
+    /// a probe actually sends.
+    #[test]
+    fn template_headers_strip_provenance_annotations() {
+        let dir = std::env::temp_dir().join(format!("tsgrab-hdr-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = dir.join("x.req.body");
+        std::fs::write(&body, b"{}").unwrap();
+        std::fs::write(
+            dir.join("x.req.out.hdr"),
+            "POST /backend-api/codex/responses\n\
+             x-incoming-path: /backend-api/codex/responses\n\
+             x-codex-turn-state: gAAA0123456789==   <- sent (last write wins)\n\
+             # from file:   x-other: redacted\n\
+             x-plain: keep-me\n\
+             authorization: Bearer redacted   <- sent (last write wins)\n",
+        )
+        .unwrap();
+
+        let headers = headers_from_template(&body, None);
+        let get = |n: &str| headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+
+        assert_eq!(get("x-codex-turn-state").as_deref(), Some("gAAA0123456789=="));
+        assert_eq!(get("x-plain").as_deref(), Some("keep-me"));
+        // recordings carry real credentials; --auth replaces them, so what the template had
+        // must survive parsing unchanged until then
+        assert_eq!(get("authorization").as_deref(), Some("Bearer redacted"));
+
+        // with --inject, the template's turn-state is dropped entirely
+        let headers = headers_from_template(&body, Some("fresh"));
+        assert!(!headers.iter().any(|(k, _)| k == "x-codex-turn-state"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

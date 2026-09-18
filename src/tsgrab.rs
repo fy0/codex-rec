@@ -250,6 +250,10 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
 pub struct Identity {
     pub session: String,
     pub turn: String,
+    /// `context_window_id` -- a third uuid, distinct from session/turn like the client's.
+    pub context: String,
+    /// `turn_started_at_unix_ms` -- stamped into the turn-metadata at build time.
+    pub started_ms: u64,
 }
 
 /// RFC-4122-shaped, time-ordered id, matching what the codex client generates (`01a0…`).
@@ -283,7 +287,50 @@ fn mix(mut x: u64) -> u64 {
 }
 
 pub fn identity() -> Identity {
-    Identity { session: new_uuid(), turn: new_uuid() }
+    Identity {
+        session: new_uuid(),
+        turn: new_uuid(),
+        context: new_uuid(),
+        started_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    }
+}
+
+/// Rewrites the identity fields inside an `x-codex-turn-metadata` JSON string -- the same edit
+/// whether the string sits in a request header or in `client_metadata` inside the body.
+fn refresh_turn_metadata(raw: &str, id: &Identity) -> Option<String> {
+    let mut inner: Value = serde_json::from_str(raw).ok()?;
+    let o = inner.as_object_mut()?;
+    for f in ["session_id", "thread_id"] {
+        o.insert(f.to_owned(), json!(id.session));
+    }
+    for f in ["turn_id", "root_turn_id"] {
+        o.insert(f.to_owned(), json!(id.turn));
+    }
+    o.insert("window_id".to_owned(), json!(format!("{}:0", id.session)));
+    o.insert("context_window_id".to_owned(), json!(id.context));
+    o.insert("turn_started_at_unix_ms".to_owned(), json!(id.started_ms));
+    Some(serde_json::to_string(&inner).unwrap_or_default())
+}
+
+/// The request-line headers that carry the attempt's identity. The recorded values are stale
+/// the moment the template is written, and replaying them is exactly what makes a probe look
+/// like a re-sent turn, so every attempt gets fresh ids -- the same edit the body applies.
+fn refresh_identity_headers(headers: &mut Vec<(String, String)>, id: &Identity) {
+    for (k, v) in headers.iter_mut() {
+        match k.as_str() {
+            "session-id" | "thread-id" | "x-client-request-id" => *v = id.session.clone(),
+            "x-codex-window-id" => *v = format!("{}:0", id.session),
+            "x-codex-turn-metadata" => {
+                if let Some(s) = refresh_turn_metadata(v, id) {
+                    *v = s;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // --------------------------------------------------------------------------- token helpers
@@ -427,7 +474,8 @@ fn is_zstd(raw: &[u8]) -> bool {
     raw.len() > 4 && raw[0] == 0x28 && raw[1] == 0xb5 && raw[2] == 0x2f && raw[3] == 0xfd
 }
 
-/// Applies the configured environment rewrite, then `--inject` / `--field` / `--patch`.
+/// Applies the configured environment rewrite, a fresh per-attempt identity (always), then
+/// `--inject` / `--field` / `--patch`.
 ///
 /// The rewrite matters even for a pure probe: the recorded template carries the
 /// `<environment_context>` block **as the client sent it**, so without this step the probe would go
@@ -444,10 +492,6 @@ fn build_body(
 ) -> (Vec<u8>, Vec<String>) {
     let mut notes = Vec::new();
     let encoded = is_zstd(template);
-    let env_active = env.map(|e| e.is_active()).unwrap_or(false);
-    if !vary.is_active() && !env_active {
-        return (template.to_vec(), notes);
-    }
     let Some(plain) = zstd_decode(template) else {
         notes.push("body is not decodable zstd; rewrites ignored (sent unchanged)".to_owned());
         return (template.to_vec(), notes);
@@ -470,28 +514,15 @@ fn build_body(
         }
     }
 
-    if !vary.is_active() {
-        return encode_back(&v, encoded, notes);
-    }
-
-    // fresh identity, applied to the fields the client derives it from
-    let sids = ["session_id", "thread_id", "window_id", "context_window_id", "root_turn_id", "turn_id"];
+    // (B) fresh identity on every attempt, not just under --vary: the template's session/turn ids
+    // belong to a request that was already sent, and replaying them is exactly what makes a probe
+    // look like a re-sent turn to the backend.
     if let Some(cm) = v.get_mut("client_metadata").and_then(Value::as_object_mut) {
         for (k, val) in cm.iter_mut() {
             let kl = k.to_ascii_lowercase();
             if kl == "x-codex-turn-metadata" {
-                if let Some(inner) = val.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
-                    let mut inner = inner;
-                    if let Some(o) = inner.as_object_mut() {
-                        for f in ["session_id", "thread_id"] {
-                            o.insert(f.to_owned(), json!(inject.session));
-                        }
-                        for f in ["turn_id", "root_turn_id"] {
-                            o.insert(f.to_owned(), json!(inject.turn));
-                        }
-                        o.insert("window_id".to_owned(), json!(format!("{}:0", inject.session)));
-                    }
-                    *val = json!(serde_json::to_string(&inner).unwrap_or_default());
+                if let Some(s) = val.as_str().and_then(|s| refresh_turn_metadata(s, inject)) {
+                    *val = json!(s);
                     notes.push("client_metadata.x-codex-turn-metadata ids refreshed".to_owned());
                 }
                 continue;
@@ -502,13 +533,18 @@ fn build_body(
                 *val = json!(inject.turn);
             } else if kl == "window_id" {
                 *val = json!(format!("{}:0", inject.session));
+            } else if kl == "context_window_id" {
+                *val = json!(inject.context);
             }
         }
     }
     if v.get("prompt_cache_key").is_some() {
         v["prompt_cache_key"] = json!(inject.session);
     }
-    let _ = sids;
+
+    if !vary.is_active() {
+        return encode_back(&v, encoded, notes);
+    }
 
     let blank = |v: &mut Value, field: &str| -> usize {
         if let Some(obj) = v.get_mut(field).and_then(Value::as_object_mut) {
@@ -716,6 +752,13 @@ pub async fn run(argv: &[String]) -> Result<(), String> {
         },
         None => crate::config::default_environment_section(),
     };
+    // A probe claims to be a request happening right now, so a `<current_date>` frozen at
+    // capture time contradicts it even when no environment rewrite is configured. `auto`
+    // converts to today's date in the element's own zone.
+    let mut env_section = env_section;
+    if !env_section.as_ref().map(|e| e.is_active()).unwrap_or(false) {
+        env_section.get_or_insert_with(Default::default).current_date = Some("auto".to_owned());
+    }
 
     let mut headers = headers_from_template(&args.body, args.vary.turn_state.as_deref());
     if let Some(tok) = args.vary.turn_state.as_ref() {
@@ -747,11 +790,6 @@ pub async fn run(argv: &[String]) -> Result<(), String> {
             headers.push(("chatgpt-account-id".to_owned(), FAKE_ACCOUNT.to_owned()));
         }
     }
-    for (k, v) in &args.headers {
-        headers.retain(|(n, _)| n != k);
-        headers.push((k.clone(), v.clone()));
-    }
-
     let source = resolve_source(&args)?;
     let mut builder = crate::tsgrab_http_builder(args.timeout, args.insecure, source, args.proxy.as_deref());
     builder = builder.pool_max_idle_per_host(1).http1_only();
@@ -930,11 +968,21 @@ pub async fn run(argv: &[String]) -> Result<(), String> {
             }
         }
 
+        // Fresh identity in the headers too -- the recorded session/turn ids went out with the
+        // original request, and re-sending them is what makes a probe look like a replay.
+        // Explicit `--header` values are applied last so they still win.
+        let mut attempt_headers = headers.clone();
+        refresh_identity_headers(&mut attempt_headers, &id);
+        for (k, v) in &args.headers {
+            attempt_headers.retain(|(n, _)| n != k);
+            attempt_headers.push((k.clone(), v.clone()));
+        }
+
         let mut req = client
             .post(&args.url)
             .header("content-type", "application/json")
             .body(body.clone());
-        let enc = headers
+        let enc = attempt_headers
             .iter()
             .find(|(k, _)| k == "content-encoding")
             .map(|(_, v)| v.clone())
@@ -944,7 +992,7 @@ pub async fn run(argv: &[String]) -> Result<(), String> {
         } else {
             req = req.header("content-encoding", "identity");
         }
-        for (k, v) in &headers {
+        for (k, v) in &attempt_headers {
             if k == "content-encoding" || k == "content-type" {
                 continue;
             }
@@ -955,7 +1003,13 @@ pub async fn run(argv: &[String]) -> Result<(), String> {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                println!("[{n:02}] ERROR {}", one_line(&e.to_string()));
+                // Quiet callers treat stdout as the token channel; a transport error must
+                // never land there or it would be installed as if it were a token.
+                if args.quiet {
+                    eprintln!("[{n:02}] ERROR {}", one_line(&e.to_string()));
+                } else {
+                    println!("[{n:02}] ERROR {}", one_line(&e.to_string()));
+                }
                 sleep(args.gap_ms).await;
                 continue;
             }
@@ -1040,14 +1094,26 @@ pub async fn run(argv: &[String]) -> Result<(), String> {
         sleep(args.gap_ms).await;
     }
 
-    let Some(rec) = accepted.or(last.filter(|r| r["token"].is_null() && args.quiet)) else {
+    let Some(rec) = accepted.or_else(|| last.clone().filter(|r| r["token"].is_null() && args.quiet)) else {
         if !args.quiet {
             println!();
             println!("no token matched {} in {} attempt(s)",
                      if args.want.is_empty() { "(any)".to_owned() } else { args.want.join("/") },
                      args.attempts);
         }
-        return Err("no matching turn-state".to_owned());
+        // A miss is still a measurement: record what came back in --out so a rotation loop
+        // sees the length the backend actually sent -- a 312 is a different problem from
+        // no header at all, and a new unexpected length must not look like either.
+        if let (Some(out), Some(r)) = (args.out.as_ref(), last.as_ref()) {
+            if let Some(parent) = out.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(out, serde_json::to_string_pretty(r).unwrap_or_default());
+        }
+        let got = last.as_ref()
+            .map(|r| format!(" (got len={} http={})", r["len"], r["http_status"]))
+            .unwrap_or_default();
+        return Err(format!("no matching turn-state{got}"));
     };
 
     if !rec["token"].is_null() {

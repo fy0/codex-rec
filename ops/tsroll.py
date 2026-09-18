@@ -22,7 +22,7 @@ State files (same formats the earlier bash version wrote; fpstatus.sh reads them
   state/current.json   the token in the slot plus probe metadata
   state/events.jsonl   one JSON line per miss/install
   state/roll.log       human-readable log
-  state/last.status    rc/http/err of the last probe
+  state/last.status    rc/http/err/len of the last probe (len = the turn-state length seen)
   state/roll.pid       the loop's pid, so fpstatus can tell alive from dead
 """
 
@@ -68,9 +68,9 @@ def event(**kw) -> None:
         f.write(json.dumps(kw) + "\n")
 
 
-def last_status(rc: int, http: str, err: str) -> None:
+def last_status(rc: int, http: str, err: str, ln=None) -> None:
     with open(STATE / "last.status", "w") as f:
-        f.write(f"rc={rc}\nhttp={http}\nerr={err}\n")
+        f.write(f"rc={rc}\nhttp={http}\nerr={err}\nlen={ln}\n")
 
 
 def token_issued(tok: str):
@@ -201,32 +201,43 @@ def random_v6(subnet: str) -> str:
 
 
 def probe(body, args) -> tuple:
-    """One probe. Returns (token, {rc, http, err, src}).
+    """One probe. Returns (token, {rc, http, err, len, src}).
 
-    tsgrab --quiet prints exactly the token when a 292 matched. Its exit code tells the
-    misses apart: rc=1 means a response came back with a turn-state of the wrong length;
-    rc=0 with no output means the response carried no turn-state at all.
+    Deliberately NOT --quiet: the verbose `[NN] HTTP ... turn-state=N` line is the only place
+    a missed probe reports the length it actually saw. A miss with len=312 is a different
+    problem from len=0 (no header at all), and recording N means a new unexpected length can
+    never look identical to a known one. The token is taken only from the `token: ...` line
+    tsgrab prints on a hit, so nothing else on stdout can ever be installed by accident.
     """
     out = STATE / "last.json"
     out.unlink(missing_ok=True)
     cmd = [BIN, "tsgrab", "--body-file", str(body), "--auth", AUTH,
-           "--want-lengths", WANT, "--attempts", "1", "--timeout", "30", "--quiet",
+           "--want-lengths", WANT, "--attempts", "1", "--timeout", "30",
            "--out", str(out)]
     src = ""
     if args.v6_subnet:
         src = random_v6(args.v6_subnet)
         cmd += ["--source-ip", src]
     r = run(cmd, timeout=60)
-    tok = r.stdout.strip()
-    http, err = "", ""
+    tok = ""
+    ln, http, err = None, "", ""
+    if m := re.search(r"(?m)^token:\s*(\S+)", r.stdout):
+        tok = m.group(1)
+    if m := re.search(r"turn-state=\s*(\d+)", r.stdout):
+        ln = int(m.group(1))
+    if m := re.search(r"(?m)^\[\d+\]\s+HTTP\s+(\d+)", r.stdout):
+        http = m.group(1)
     if out.is_file():
         try:
-            http = str(json.loads(out.read_text()).get("http_status") or "")
+            meta = json.loads(out.read_text())
+            http = http or str(meta.get("http_status") or "")
+            if ln is None:
+                ln = meta.get("len")
         except Exception:
             pass
     if r.stderr.strip():
         err = r.stderr.strip().splitlines()[0][:200]
-    return tok, {"rc": r.returncode, "http": http, "err": err, "src": src}
+    return tok, {"rc": r.returncode, "http": http, "err": err, "len": ln, "src": src}
 
 
 def install(tok: str, source: str, probes: int, replaced_age_min, info: dict) -> None:
@@ -273,16 +284,17 @@ def hunt(args) -> bool:
     for n in range(1, args.budget + 1):
         body, info = build_probe_body()
         tok, status = probe(body or TPL, args)
-        last_status(status["rc"], status["http"], status["err"])
+        last_status(status["rc"], status["http"], status["err"], status["len"])
         if tok:
             install(tok, "probe", n, age_min, info)
             return True
         event(event="miss", probes=n, slot_age_min=round(age_min) if age_min is not None else None,
               rc=status["rc"], http=status["http"], err=status["err"], src=status["src"],
-              **{k: v for k, v in info.items()})
+              len=status["len"], **{k: v for k, v in info.items()})
         slot = f"{age_min:.0f}min" if age_min is not None else "new"
+        got = status["len"] if status["len"] is not None else "?"
         log(f"miss {n}/{args.budget} rc={status['rc']} http={status['http'] or '-'} "
-            f"err={status['err'] or '-'} slot_age={slot} "
+            f"got_len={got} err={status['err'] or '-'} slot_age={slot} "
             f"shape={info.get('shape', '-')} src={status['src'] or '-'}")
         if n < args.budget:
             time.sleep(args.retry + random.randint(0, args.retry_jitter))

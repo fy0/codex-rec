@@ -176,10 +176,16 @@ struct Sink {
     sessions: Option<Arc<Sessions>>,
     spilled: Option<std::path::PathBuf>,
     finished: bool,
+    /// Bytes actually received from upstream and teed to the client, so a stream that ends
+    /// short of the declared content-length is reported with numbers instead of silently
+    /// producing a truncated recording.
+    resp_bytes: u64,
+    resp_declared_len: Option<u64>,
 }
 
 impl Sink {
     fn write_chunk(&mut self, chunk: &[u8]) {
+        self.resp_bytes += chunk.len() as u64;
         if let Some(f) = self.file.as_mut() {
             let _ = f.write_all(chunk);
         }
@@ -202,7 +208,16 @@ impl Sink {
         };
 
         let mut index = self.index_row.take().unwrap_or_else(|| json!({}));
+        if let Some(declared) = self.resp_declared_len {
+            if declared != self.resp_bytes {
+                eprintln!(
+                    "[response length mismatch] content-length declared {declared}, received {} bytes (status {})",
+                    self.resp_bytes, self.status
+                );
+            }
+        }
         if let Some(obj) = index.as_object_mut() {
+            obj.insert("response_bytes".to_owned(), json!(self.resp_bytes));
             obj.insert("status".to_owned(), json!(self.status));
             obj.insert("origin".to_owned(), json!(self.origin));
             obj.insert("response_file".to_owned(), json!(self.recorded));
@@ -282,7 +297,8 @@ impl Stream for TeeStream {
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(e))) => {
-                eprintln!("[upstream stream error] {e}");
+                let so_far = this.sink.lock().map(|s| s.resp_bytes).unwrap_or(0);
+                eprintln!("[upstream stream error after {so_far} bytes] {e}");
                 if let Ok(mut s) = this.sink.lock() {
                     s.finish();
                 }
@@ -308,6 +324,13 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
     let record = &app.recorder.record;
     let (parts, incoming_body) = req.into_parts();
     let method = parts.method.clone();
+    // What the client declared, so a body that arrives short or long is reported with numbers
+    // at the moment it happens, not discovered later as a corrupted upstream request.
+    let declared_body_len = parts
+        .headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
 
     // `uri_in` is what the client asked for (logged as-is); `uri` is what we send upstream after the
     // [routes] path mapping. Both are recorded, so the mapping stays auditable.
@@ -478,6 +501,14 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                         buffered.total
                     );
                 }
+                if let Some(declared) = declared_body_len {
+                    if declared != body_total {
+                        eprintln!(
+                            "[request body length mismatch] content-length declared {declared}, received {body_total} bytes{}",
+                            if body_over_limit { " (over limit, spilled)" } else { "" }
+                        );
+                    }
+                }
                 body_bytes = buffered.head.clone();
                 if let Some(path) = buffered.spill {
                     let mut forward_path = path.clone();
@@ -554,7 +585,11 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                             }
                             None => {
                                 eprintln!(
-                                    "[body rewrite skipped] the body was zstd-compressed and cannot be                                      re-compressed without the zstd CLI: set $ZSTD or put zstd(.exe) on                                      PATH (the request was forwarded unchanged)"
+                                    "[body rewrite skipped] the body was zstd-compressed and cannot be \
+                                     re-compressed without the zstd CLI: set $ZSTD or put zstd(.exe) on PATH \
+                                     (forwarded unchanged: {} bytes in, rewrite would have been {} bytes)",
+                                    body_bytes.len(),
+                                    new.len()
                                 );
                             }
                         }
@@ -566,9 +601,20 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
                 _ => eprintln!("[body rewrite skipped] body is not a JSON object"),
             },
             None => eprintln!(
-                "[body rewrite skipped] could not decode the body: set $ZSTD or put zstd(.exe) on PATH                  (the request was forwarded unchanged)"
+                "[body rewrite skipped] could not decode the body: set $ZSTD or put zstd(.exe) on PATH \
+                 (the request was forwarded unchanged, {} bytes)",
+                body_bytes.len()
             ),
         }
+    }
+    if rewritten {
+        println!(
+            "[rewrite body] {} bytes in{} -> {} bytes out{}",
+            body_bytes.len(),
+            if cenc.is_some() { " (zstd)" } else { "" },
+            body_out.len(),
+            if cenc.is_some() { " (zstd)" } else { "" },
+        );
     }
 
     // ---- request artifacts
@@ -622,6 +668,7 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
             "env_rewrite": env_notes_detail,
             "request_body_bytes": body_total,
             "request_body_spilled": body_over_limit,
+            "request_body_out_bytes": if rewritten { json!(body_out.len()) } else { Value::Null },
         })
     } else {
         Value::Null
@@ -685,6 +732,11 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let resp_declared_len = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
 
     let mut resp_lines: Vec<String> = vec![format!("HTTP {}", status.as_u16())];
     let mut rb = Response::builder().status(status);
@@ -863,6 +915,8 @@ async fn handle(State(app): State<Arc<App>>, req: axum::extract::Request) -> Res
         sessions: app.sessions.clone(),
         spilled,
         finished: false,
+        resp_bytes: 0,
+        resp_declared_len,
     }));
     let stream = TeeStream {
         inner: Box::pin(resp.bytes_stream()),
@@ -1010,12 +1064,14 @@ async fn main() {
     );
     let record = cfg.record.clone();
     if record.enabled {
+        let days = |v: Option<u64>| v.map(|d| format!("{d}d")).unwrap_or_else(|| "off".to_owned());
+        let bytes = |v: Option<u64>| v.map(|b| format!("{b}B")).unwrap_or_else(|| "off".to_owned());
         println!(
-            "recording into {} (session dirs; retention={:?}d gzip={:?}d max={:?}B)",
+            "recording into {} (session dirs; retention={} gzip-after={} max-total={})",
             cfg.log_dir.display(),
-            record.retention_days,
-            record.gzip_after_days,
-            record.max_total_bytes
+            days(record.retention_days),
+            days(record.gzip_after_days),
+            bytes(record.max_total_bytes)
         );
         println!(
             "record switches: index={} req.hdr={} req.out.hdr={} req.body={} req.json={} req.summary={} resp.hdr={} resp.stream={} resp.catalog_stream={} resp.summary={}",

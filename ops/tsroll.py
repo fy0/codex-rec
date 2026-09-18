@@ -92,11 +92,15 @@ def read_slot() -> str:
 def token_age() -> float:
     """Age of the installed token, from its embedded issue time -- not the file mtime.
     The mtime only says when the slot was last written; a scan can install a token that
-    was already minutes old, and the use-by clock keeps running regardless."""
+    was already minutes old, and the use-by clock keeps running regardless.
+    No slot at all -> inf, so the very first loop pass goes hunting immediately."""
     issued = token_issued(read_slot())
     if issued:
         return max(0.0, time.time() - issued)
-    return max(0.0, time.time() - TOKFILE.stat().st_mtime)
+    try:
+        return max(0.0, time.time() - TOKFILE.stat().st_mtime)
+    except OSError:
+        return float("inf")
 
 
 def run(cmd: list, timeout: int = 90) -> subprocess.CompletedProcess:
@@ -187,8 +191,17 @@ def build_probe_body() -> tuple:
     return body, info
 
 
-def probe(body) -> tuple:
-    """One probe. Returns (token, {rc, http, err}).
+def random_v6(subnet: str) -> str:
+    """One random address from the subnet. A fresh source per probe keeps any single
+    address from accumulating a history with the backend."""
+    import ipaddress
+    net = ipaddress.IPv6Network(subnet.strip(), strict=False)
+    off = random.getrandbits(128 - net.prefixlen) or 1
+    return str(ipaddress.IPv6Address(int(net.network_address) + off))
+
+
+def probe(body, args) -> tuple:
+    """One probe. Returns (token, {rc, http, err, src}).
 
     tsgrab --quiet prints exactly the token when a 292 matched. Its exit code tells the
     misses apart: rc=1 means a response came back with a turn-state of the wrong length;
@@ -196,9 +209,14 @@ def probe(body) -> tuple:
     """
     out = STATE / "last.json"
     out.unlink(missing_ok=True)
-    r = run([BIN, "tsgrab", "--body-file", str(body), "--auth", AUTH,
-             "--want-lengths", WANT, "--attempts", "1", "--timeout", "30", "--quiet",
-             "--out", str(out)], timeout=60)
+    cmd = [BIN, "tsgrab", "--body-file", str(body), "--auth", AUTH,
+           "--want-lengths", WANT, "--attempts", "1", "--timeout", "30", "--quiet",
+           "--out", str(out)]
+    src = ""
+    if args.v6_subnet:
+        src = random_v6(args.v6_subnet)
+        cmd += ["--source-ip", src]
+    r = run(cmd, timeout=60)
     tok = r.stdout.strip()
     http, err = "", ""
     if out.is_file():
@@ -208,16 +226,17 @@ def probe(body) -> tuple:
             pass
     if r.stderr.strip():
         err = r.stderr.strip().splitlines()[0][:200]
-    return tok, {"rc": r.returncode, "http": http, "err": err}
+    return tok, {"rc": r.returncode, "http": http, "err": err, "src": src}
 
 
-def install(tok: str, source: str, probes: int, replaced_age_min: float, info: dict) -> None:
+def install(tok: str, source: str, probes: int, replaced_age_min, info: dict) -> None:
     fd, tmp = tempfile.mkstemp(dir=TOKFILE.parent, prefix=".ts_token.")
     with os.fdopen(fd, "w") as f:
         f.write(tok)
     os.chmod(tmp, 0o644)
     os.replace(tmp, TOKFILE)  # atomic: the proxy may read the file at any instant
 
+    rag = round(replaced_age_min) if replaced_age_min is not None else None
     meta = {}
     try:
         meta = json.loads((STATE / "last.json").read_text())
@@ -225,19 +244,21 @@ def install(tok: str, source: str, probes: int, replaced_age_min: float, info: d
         pass
     meta.update(token=tok, len=len(tok), installed_at=int(time.time()),
                 installed_at_human=now_iso(), source=source, probes=probes,
-                replaced_age_min=round(replaced_age_min))
+                replaced_age_min=rag)
     (STATE / "current.json").write_text(json.dumps(meta, indent=2) + "\n")
     event(event="install", source=source, len=len(tok), probes=probes,
-          replaced_age_min=round(replaced_age_min))
+          replaced_age_min=rag)
+    rag_s = f"{rag}min" if rag is not None else "new"
     log(f"install len={len(tok)} source={source} probe={probes} "
-        f"replaced_age={replaced_age_min:.0f}min shape={info.get('shape', '-')} "
+        f"replaced_age={rag_s} shape={info.get('shape', '-')} "
         f"effort={info.get('effort', '-')}")
     push_override(tok)
 
 
 def hunt(args) -> bool:
     """One hunt cycle: scan first, then probe up to --budget times. True when installed."""
-    age_min = token_age() / 60
+    age = token_age()
+    age_min = age / 60 if age != float("inf") else None
     cur_issued = token_issued(read_slot())
     tok = scan_fresh(args.scan_fresh_within)
     # Strictly-newer gate: a scan that keeps returning the token already in the slot must
@@ -251,16 +272,18 @@ def hunt(args) -> bool:
         return True
     for n in range(1, args.budget + 1):
         body, info = build_probe_body()
-        tok, status = probe(body or TPL)
+        tok, status = probe(body or TPL, args)
         last_status(status["rc"], status["http"], status["err"])
         if tok:
             install(tok, "probe", n, age_min, info)
             return True
-        event(event="miss", probes=n, slot_age_min=round(age_min), rc=status["rc"],
-              http=status["http"], err=status["err"], **{k: v for k, v in info.items()})
+        event(event="miss", probes=n, slot_age_min=round(age_min) if age_min is not None else None,
+              rc=status["rc"], http=status["http"], err=status["err"], src=status["src"],
+              **{k: v for k, v in info.items()})
+        slot = f"{age_min:.0f}min" if age_min is not None else "new"
         log(f"miss {n}/{args.budget} rc={status['rc']} http={status['http'] or '-'} "
-            f"err={status['err'] or '-'} slot_age={age_min:.0f}min "
-            f"shape={info.get('shape', '-')}")
+            f"err={status['err'] or '-'} slot_age={slot} "
+            f"shape={info.get('shape', '-')} src={status['src'] or '-'}")
         if n < args.budget:
             time.sleep(args.retry + random.randint(0, args.retry_jitter))
     return False
@@ -291,6 +314,9 @@ def main() -> None:
     p.add_argument("--budget", type=int, default=40, help="probes per hunt")
     p.add_argument("--idle", type=int, default=1800, help="max sleep while the slot is fresh, seconds")
     p.add_argument("--scan-fresh-within", type=int, default=1800, help="scan window for reusable tokens, seconds")
+    p.add_argument("--v6-subnet", default=os.environ.get("TSROLL_V6_SUBNET", ""),
+                   help="pick a random source address from this subnet for every probe; "
+                        "the prefix must be local (ip_nonlocal_bind or a local route)")
     p.add_argument("--once", action="store_true", help="run one hunt cycle and exit")
     args = p.parse_args()
     STATE.mkdir(parents=True, exist_ok=True)

@@ -5,8 +5,7 @@ The operational side of [codex-rec](../README.md): a small set of scripts that k
 hands out per turn.
 
 The `codex-rec` binary does the work that needs to speak TLS exactly like the client
-(`tsgrab`). Everything here is bash + curl + python3, so it can be changed on a live box
-without a rebuild.
+(`tsgrab`). Everything here is python3, so it can be changed on a live box without a rebuild.
 
 ## What a turn-state is, and why it needs babysitting
 
@@ -30,16 +29,13 @@ cover the gaps, so a rotation loop is needed.
 
 | file | role |
 |---|---|
-| `tsroll.sh` | the rotation loop: check age, hunt for a newer token, install it |
+| `tsroll.py` | the rotation loop: check the token's age, hunt for a newer token, install it |
 | `tsroll.service` | systemd unit so the loop survives reboots and crashes |
+| `tsgen.py` | builds varied probe bodies (prompt shape + reasoning effort) from the template |
 | `fpstatus.sh` | one command for the current state; `\| tail -1` prints the token |
-| `tsgrab.py` | python reference for probing/replaying, kept for ad-hoc work |
-| `tsproxy.py` | run a codex-rec instance with a chosen token injected (experiments) |
-| `tsprobe.sh` | plain sampler: log what the backend hands out, no injection |
-| `tsauto.sh` | earlier rotation attempt, superseded by `tsroll.sh` (kept for reference) |
 | `override.env` | **not committed** - the admin API key when the override mirror is used |
 
-`tsroll.sh` calls `codex-rec tsgrab` for both of its inputs: `--scan-only` to read tokens the
+`tsroll.py` calls `codex-rec tsgrab` for both of its inputs: `--scan-only` to read tokens the
 recorder already logged (free, no request) and a plain probe (reads the response head, then
 aborts, so nothing is billed).
 
@@ -47,7 +43,7 @@ aborts, so nothing is billed).
 
 ```bash
 install -d /root/tsgrab/state /root/tsgrab/templates
-install -m755 tsroll.sh fpstatus.sh tsprobe.sh /root/tsgrab/
+install -m755 tsroll.py tsgen.py fpstatus.sh /root/tsgrab/
 install -m644 tsroll.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now tsroll
 ```
@@ -62,18 +58,22 @@ set_from_file = { "x-codex-turn-state" = "/root/codex-rec/ts_token.txt" }
 ## How the rotation works
 
 ```
-every 30 s:
-  token younger than 35 min?  -> nothing to do
-  otherwise -> hunt:
-      scan the recorder's history   (no request)      -> install if strictly newer
-      probe the backend             (not billed)      -> install if strictly newer
-      neither -> retry every 90 s, up to 60 times; then idle 20 min
+token younger than 35 min (by its embedded issue time)?  -> nothing to do
+otherwise -> hunt:
+    scan the recorder's history   (no request)      -> install if strictly newer
+    probe the backend             (not billed)      -> install if strictly newer
+    neither -> retry every 30 s (+0..5 s jitter), up to 40 probes per hunt
 ```
+
+The token's age comes from the issue time embedded in the token itself (u64 big-endian at
+bytes 1:9), never from the file mtime: the mtime only says when the slot was last written,
+and a scan can install a token that was already minutes old. The use-by clock keeps running
+either way, so the age check has to read the same clock the backend uses.
 
 Two properties matter, and both were learned the hard way:
 
 1. **No restart.** The token file is re-read on every request (`set_from_file`), so
-   `install_token` takes effect on the next request. Verified: the proxy's pid does not change.
+   an install takes effect on the next request. Verified: the proxy's pid does not change.
 2. **Strictly-newer gate.** Without it, a scan that keeps returning the same already-old token
    re-installs it forever: the slot never gets younger, so the age check fires again
    immediately. That produced a 30-second loop that refreshed nothing while looking busy.
@@ -122,7 +122,7 @@ OVERRIDE_KEY=<admin key>
 OVERRIDE_ACCOUNT=acct_…
 ```
 
-`tsroll.sh` sources that file when `OVERRIDE_KEY` is not already in the environment. The push
+`tsroll.py` reads that file when `OVERRIDE_KEY` is not already in the environment. The push
 is best-effort: the local write is what the proxy uses, so a failure is logged and never rolls
 it back or aborts the rotation. The request body is built by hand, so the token is checked
 against `[A-Za-z0-9_=-]` first -- a token containing a quote or newline is refused and logged
